@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
+import { subscribeTasksChanged } from "@/lib/tasks-events";
 import {
   MessageSquare,
   LayoutDashboard,
@@ -34,6 +35,25 @@ const navItems = [
   { icon: Settings, label: "設定", path: "/settings" },
 ];
 
+/** 赤い通知バッジ。count が 9 を超えたら「9+」表示、0 以下は非表示 */
+function NavBadge({ count, collapsed }: { count: number; collapsed: boolean }) {
+  if (count <= 0) return null;
+  const label = count > 9 ? "9+" : String(count);
+  return (
+    <span
+      className={cn(
+        "flex items-center justify-center rounded-full bg-red-600 text-white font-bold tabular-nums shadow-sm",
+        collapsed
+          ? "absolute top-1 right-1 min-w-[16px] h-4 text-[9px] px-1 border border-white"
+          : "ml-auto min-w-[18px] h-[18px] text-[10px] px-1.5 relative z-10"
+      )}
+      aria-label={`未完了タスク ${count} 件`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function SidebarContent({
   pathname,
   collapsed,
@@ -41,6 +61,7 @@ function SidebarContent({
   onLogout,
   loggingOut,
   onNavClick,
+  myTaskCount,
 }: {
   pathname: string | null;
   collapsed: boolean;
@@ -48,6 +69,7 @@ function SidebarContent({
   onLogout: () => void;
   loggingOut: boolean;
   onNavClick?: () => void;
+  myTaskCount: number;
 }) {
   return (
     <>
@@ -95,10 +117,16 @@ function SidebarContent({
               )}
             >
               <Icon size={20} className="flex-shrink-0 relative z-10" />
+              {path === "/tasks" && collapsed && (
+                <NavBadge count={myTaskCount} collapsed />
+              )}
               {!collapsed && (
                 <>
                   <span className="text-sm font-semibold animate-fade-in relative z-10">{label}</span>
-                  {active && (
+                  {path === "/tasks" && (
+                    <NavBadge count={myTaskCount} collapsed={false} />
+                  )}
+                  {active && path !== "/tasks" && (
                     <div className="absolute right-4 w-2 h-2 rounded-full bg-primary animate-pulse" />
                   )}
                 </>
@@ -159,6 +187,32 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(true);
   const [loggingOut, setLoggingOut] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [myTaskCount, setMyTaskCount] = useState(0);
+
+  // 自分宛の未完了タスク数。ページ遷移時／5分毎／タスク変更イベントで再取得
+  useEffect(() => {
+    let cancelled = false;
+    const fetchCount = async () => {
+      try {
+        const res = await fetch("/api/tasks/my-count", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = (await res.json()) as { count?: number };
+        if (!cancelled) setMyTaskCount(Math.max(0, Number(data.count) || 0));
+      } catch {
+        // 静かに握る
+      }
+    };
+    void fetchCount();
+    const intervalId = window.setInterval(fetchCount, 5 * 60 * 1000);
+    const unsub = subscribeTasksChanged(() => {
+      void fetchCount();
+    });
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      unsub();
+    };
+  }, [pathname]);
 
   const handleLogout = async () => {
     if (loggingOut) return;
@@ -237,6 +291,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           onCollapsedToggle={() => setCollapsed(!collapsed)}
           onLogout={handleLogout}
           loggingOut={loggingOut}
+          myTaskCount={myTaskCount}
         />
       </aside>
 
@@ -255,6 +310,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               onLogout={handleLogout}
               loggingOut={loggingOut}
               onNavClick={() => setMobileMenuOpen(false)}
+              myTaskCount={myTaskCount}
             />
           </div>
         </SheetContent>

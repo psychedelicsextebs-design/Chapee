@@ -38,6 +38,7 @@ import {
   HANDLING_STATUS_VALUES,
 } from "@/lib/handling-status";
 import { getStickerPresetsForMarket } from "@/lib/sticker-presets";
+import { ChatSidebarTasksPanel } from "@/components/ChatSidebarTasksPanel";
 
 type AttachedFile = {
   id: string;
@@ -1047,6 +1048,13 @@ export default function ChatDetailPage() {
               </TooltipProvider>
             )}
           </div>
+
+          {/* タスク — この会話に紐づくタスクを表示・追加 */}
+          <ChatSidebarTasksPanel
+            conversationId={conversation.id}
+            buyerId={String(conversation.customer_id)}
+            country={conversation.country}
+          />
         </>
       )}
     </div>

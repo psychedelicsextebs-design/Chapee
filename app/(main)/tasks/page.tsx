@@ -15,9 +15,6 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -26,41 +23,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogFooter,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { SHOPEE_MARKET_CODES } from "@/lib/shopee-markets";
 import type { TaskApi } from "@/lib/tasks";
-
-type StaffRow = {
-  id: string;
-  name: string;
-  email: string;
-  role: string;
-};
-
-/** yyyy-mm-ddThh:mm → Date（ローカル解釈）、空は null */
-function datetimeLocalToISO(v: string): string | null {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-/** Date ISO → yyyy-mm-ddThh:mm（datetime-local 用） */
-function isoToDatetimeLocal(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return "";
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
+import { TaskEditorDialog, type StaffOption } from "@/components/TaskEditorDialog";
+import {
+  dispatchTasksChanged,
+  subscribeTasksChanged,
+} from "@/lib/tasks-events";
 
 function formatDueDate(iso: string | null): string {
   if (!iso) return "期限なし";
@@ -81,41 +52,20 @@ function isOverdue(iso: string | null): boolean {
   return !isNaN(d.getTime()) && d.getTime() < Date.now();
 }
 
-type EditorState = {
-  open: boolean;
-  /** 編集中のタスク ID（null なら新規作成） */
-  taskId: string | null;
-  title: string;
-  content: string;
-  assignees: string[];
-  dueDateLocal: string;
-  country: string;
-};
-
-const EMPTY_EDITOR: EditorState = {
-  open: false,
-  taskId: null,
-  title: "",
-  content: "",
-  assignees: [],
-  dueDateLocal: "",
-  country: "",
-};
-
 export default function TasksPage() {
   const [tasks, setTasks] = useState<TaskApi[]>([]);
-  const [staff, setStaff] = useState<StaffRow[]>([]);
+  const [staff, setStaff] = useState<StaffOption[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [tab, setTab] = useState<"pending" | "done">("pending");
   const [filterCountry, setFilterCountry] = useState<string>("all");
   const [filterAssignee, setFilterAssignee] = useState<string>("all");
 
-  const [editor, setEditor] = useState<EditorState>(EMPTY_EDITOR);
-  const [saving, setSaving] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<TaskApi | null>(null);
 
   const staffById = useMemo(() => {
-    const m = new Map<string, StaffRow>();
+    const m = new Map<string, StaffOption>();
     for (const s of staff) m.set(s.id, s);
     return m;
   }, [staff]);
@@ -131,7 +81,7 @@ export default function TasksPage() {
     const res = await fetch("/api/staff");
     if (!res.ok) throw new Error("load staff failed");
     const data = await res.json();
-    setStaff((data.staff || []) as StaffRow[]);
+    setStaff((data.staff || []) as StaffOption[]);
   }, []);
 
   useEffect(() => {
@@ -146,6 +96,13 @@ export default function TasksPage() {
       }
     })();
   }, [loadTasks, loadStaff]);
+
+  // 他の画面でタスクが変わったら再取得
+  useEffect(() => {
+    return subscribeTasksChanged(() => {
+      void loadTasks();
+    });
+  }, [loadTasks]);
 
   const visibleTasks = useMemo(() => {
     return tasks.filter((t) => {
@@ -163,73 +120,22 @@ export default function TasksPage() {
   const doneCount = useMemo(() => tasks.filter((t) => t.completed).length, [tasks]);
 
   const openCreate = () => {
-    setEditor({ ...EMPTY_EDITOR, open: true });
+    setEditingTask(null);
+    setEditorOpen(true);
   };
 
   const openEdit = (t: TaskApi) => {
-    setEditor({
-      open: true,
-      taskId: t.id,
-      title: t.title,
-      content: t.content,
-      assignees: [...t.assignees],
-      dueDateLocal: isoToDatetimeLocal(t.due_date),
-      country: t.country ?? "",
+    setEditingTask(t);
+    setEditorOpen(true);
+  };
+
+  const handleSaved = (saved: TaskApi) => {
+    setTasks((prev) => {
+      const exists = prev.some((t) => t.id === saved.id);
+      return exists
+        ? prev.map((t) => (t.id === saved.id ? saved : t))
+        : [saved, ...prev];
     });
-  };
-
-  const closeEditor = () => setEditor(EMPTY_EDITOR);
-
-  const toggleAssigneeInEditor = (id: string) => {
-    setEditor((e) => ({
-      ...e,
-      assignees: e.assignees.includes(id)
-        ? e.assignees.filter((x) => x !== id)
-        : [...e.assignees, id],
-    }));
-  };
-
-  const saveTask = async () => {
-    const title = editor.title.trim();
-    if (!title) {
-      toast.error("タスク名を入力してください");
-      return;
-    }
-    setSaving(true);
-    try {
-      const body = {
-        title,
-        content: editor.content,
-        assignees: editor.assignees,
-        due_date: datetimeLocalToISO(editor.dueDateLocal),
-        country: editor.country || null,
-      };
-      const res = editor.taskId
-        ? await fetch(`/api/tasks/${editor.taskId}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          })
-        : await fetch("/api/tasks", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          });
-      if (!res.ok) throw new Error();
-      const data = (await res.json()) as { task: TaskApi };
-      setTasks((prev) => {
-        if (editor.taskId) {
-          return prev.map((t) => (t.id === data.task.id ? data.task : t));
-        }
-        return [data.task, ...prev];
-      });
-      toast.success(editor.taskId ? "タスクを更新しました" : "タスクを作成しました");
-      closeEditor();
-    } catch {
-      toast.error("保存に失敗しました");
-    } finally {
-      setSaving(false);
-    }
   };
 
   const toggleComplete = async (t: TaskApi) => {
@@ -243,6 +149,7 @@ export default function TasksPage() {
       const data = (await res.json()) as { task: TaskApi };
       setTasks((prev) => prev.map((x) => (x.id === t.id ? data.task : x)));
       toast.success(data.task.completed ? "タスクを完了しました" : "タスクを未完了に戻しました");
+      dispatchTasksChanged();
     } catch {
       toast.error("更新に失敗しました");
     }
@@ -255,6 +162,7 @@ export default function TasksPage() {
       if (!res.ok) throw new Error();
       setTasks((prev) => prev.filter((x) => x.id !== id));
       toast.success("削除しました");
+      dispatchTasksChanged();
     } catch {
       toast.error("削除に失敗しました");
     }
@@ -361,7 +269,7 @@ export default function TasksPage() {
           {visibleTasks.map((t) => {
             const assigneeRows = t.assignees
               .map((id) => staffById.get(id))
-              .filter((v): v is StaffRow => Boolean(v));
+              .filter((v): v is StaffOption => Boolean(v));
             const overdue = !t.completed && isOverdue(t.due_date);
             return (
               <div
@@ -395,7 +303,6 @@ export default function TasksPage() {
                       </span>
                     </div>
                   </div>
-                  {/* 担当者アバター群 */}
                   <div className="flex -space-x-1 flex-shrink-0">
                     {assigneeRows.length === 0 ? (
                       <div className="w-8 h-8 rounded-full bg-gray-100 border-2 border-white flex items-center justify-center text-[10px] text-gray-400">
@@ -422,14 +329,12 @@ export default function TasksPage() {
                   </div>
                 </div>
 
-                {/* 内容 */}
                 {t.content && (
                   <div className="mt-3 rounded-xl bg-gray-50 border border-gray-200 p-3 text-sm text-gray-800 whitespace-pre-wrap">
                     {t.content}
                   </div>
                 )}
 
-                {/* フッター */}
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     {t.conversation_id && (
@@ -487,129 +392,13 @@ export default function TasksPage() {
         </div>
       )}
 
-      {/* 追加・編集ダイアログ */}
-      <Dialog open={editor.open} onOpenChange={(o) => !o && closeEditor()}>
-        <DialogContent className="sm:max-w-lg border-border shadow-card">
-          <DialogHeader>
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 gradient-primary rounded-lg flex items-center justify-center">
-                <ListTodo size={14} className="text-primary-foreground" />
-              </div>
-              <DialogTitle className="text-base">
-                {editor.taskId ? "タスクを編集" : "タスクを追加"}
-              </DialogTitle>
-            </div>
-            <DialogDescription className="text-left text-xs">
-              タスク名は必須。担当者と期限は任意です。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4 py-2">
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">タスク名</label>
-              <Input
-                value={editor.title}
-                onChange={(e) => setEditor((s) => ({ ...s, title: e.target.value }))}
-                placeholder="例: 要確認"
-                autoFocus
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">内容</label>
-              <Textarea
-                value={editor.content}
-                onChange={(e) => setEditor((s) => ({ ...s, content: e.target.value }))}
-                placeholder="詳細を入力（複数行可）"
-                rows={4}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">担当者</label>
-              {staff.length === 0 ? (
-                <p className="text-xs text-gray-500">
-                  担当者が登録されていません。先に「担当者管理」から登録してください。
-                </p>
-              ) : (
-                <div className="max-h-40 overflow-y-auto space-y-1 rounded-lg border border-border p-2">
-                  {staff.map((s) => {
-                    const checked = editor.assignees.includes(s.id);
-                    return (
-                      <label
-                        key={s.id}
-                        className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-primary-subtle/40 cursor-pointer"
-                      >
-                        <Checkbox
-                          checked={checked}
-                          onCheckedChange={() => toggleAssigneeInEditor(s.id)}
-                        />
-                        <div className="w-6 h-6 rounded-full gradient-primary flex items-center justify-center flex-shrink-0">
-                          <span className="text-primary-foreground font-bold text-[10px]">
-                            {s.name[0]}
-                          </span>
-                        </div>
-                        <span className="text-sm text-gray-800">{s.name}</span>
-                        <span className="text-xs text-gray-400 ml-auto truncate max-w-[140px]">
-                          {s.email}
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-muted-foreground">期限</label>
-                <Input
-                  type="datetime-local"
-                  value={editor.dueDateLocal}
-                  onChange={(e) => setEditor((s) => ({ ...s, dueDateLocal: e.target.value }))}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-muted-foreground">国（任意）</label>
-                <Select
-                  value={editor.country || "none"}
-                  onValueChange={(v) =>
-                    setEditor((s) => ({ ...s, country: v === "none" ? "" : v }))
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="—" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">—</SelectItem>
-                    {SHOPEE_MARKET_CODES.map((c) => (
-                      <SelectItem key={c} value={c}>
-                        {c}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-          </div>
-          <DialogFooter className="gap-2 sm:gap-0">
-            <Button variant="outline" size="sm" onClick={closeEditor} disabled={saving}>
-              キャンセル
-            </Button>
-            <Button
-              size="sm"
-              className="gradient-primary text-primary-foreground shadow-green"
-              onClick={saveTask}
-              disabled={saving}
-            >
-              {saving ? (
-                <>
-                  <Loader2 size={14} className="animate-spin mr-1" />
-                  保存中
-                </>
-              ) : (
-                "保存"
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <TaskEditorDialog
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        task={editingTask}
+        staff={staff}
+        onSaved={handleSaved}
+      />
     </div>
   );
 }
