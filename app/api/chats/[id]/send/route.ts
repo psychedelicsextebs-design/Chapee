@@ -1,0 +1,143 @@
+import { NextRequest, NextResponse } from "next/server";
+import { sendMessage, sendStickerMessage } from "@/lib/shopee-api";
+import { getValidToken, resolveCountryForShop } from "@/lib/shopee-token";
+import { getCollection } from "@/lib/mongodb";
+import { clearAutoReplySchedule } from "@/lib/auto-reply";
+import {
+  extractMessageIdFromSendResponse,
+  recordStaffMessageKind,
+} from "@/lib/staff-message-kind";
+
+/**
+ * POST /api/chats/[id]/send - Send message to customer via Shopee
+ */
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id: conversationId } = await params;
+    const body = (await request.json()) as {
+      message?: string;
+      sticker_package_id?: string;
+      sticker_id?: string;
+      /** UI: テンプレから送った場合は template */
+      send_kind?: string;
+    };
+    const { message } = body;
+    const stickerPackageId = String(body.sticker_package_id ?? "").trim();
+    const stickerId = String(body.sticker_id ?? "").trim();
+    const isStickerSend = stickerPackageId.length > 0 && stickerId.length > 0;
+
+    if (!isStickerSend && (!message || !message.trim())) {
+      return NextResponse.json(
+        { error: "メッセージが空です" },
+        { status: 400 }
+      );
+    }
+
+    // Get conversation to find shop_id
+    const col = await getCollection<{
+      conversation_id: string;
+      shop_id: number;
+      country?: string;
+      customer_name: string;
+      customer_id: number;
+    }>("shopee_conversations");
+
+    const conversation = await col.findOne({
+      conversation_id: String(conversationId),
+    });
+
+    if (!conversation) {
+      return NextResponse.json(
+        { error: "会話が見つかりません" },
+        { status: 404 }
+      );
+    }
+
+    const toId = Number(conversation.customer_id);
+    if (!Number.isFinite(toId) || toId <= 0) {
+      return NextResponse.json(
+        {
+          error:
+            "買い手のユーザーIDが取得できません。設定から「全店舗同期」を実行して会話を取り込み直してください。",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Get valid access token
+    const accessToken = await getValidToken(conversation.shop_id);
+    const countryResolved = await resolveCountryForShop(
+      conversation.shop_id,
+      conversation.country
+    );
+    const countryOpt = { country: countryResolved };
+
+    const textBody = (message ?? "").trim();
+
+    const response = isStickerSend
+      ? ((await sendStickerMessage(
+          accessToken,
+          conversation.shop_id,
+          toId,
+          stickerPackageId,
+          stickerId,
+          countryOpt
+        )) as Record<string, unknown>)
+      : ((await sendMessage(
+          accessToken,
+          conversation.shop_id,
+          toId,
+          textBody,
+          countryOpt
+        )) as Record<string, unknown>);
+
+    const tagKind =
+      body.send_kind === "template" ? ("template" as const) : ("manual" as const);
+    const mid = extractMessageIdFromSendResponse(response);
+    if (mid) {
+      await recordStaffMessageKind(
+        String(conversationId),
+        conversation.shop_id,
+        mid,
+        tagKind
+      );
+    }
+
+    const lastPreview = isStickerSend ? "[スタンプ]" : textBody;
+
+    // Update conversation last_message_time
+    await col.updateOne(
+      { conversation_id: String(conversationId) },
+      {
+        $set: {
+          last_message: lastPreview,
+          last_message_time: new Date(),
+          unread_count: 0,
+          handling_status: "in_progress",
+          updated_at: new Date(),
+        },
+      }
+    );
+
+    await clearAutoReplySchedule(conversationId, conversation.shop_id);
+
+    return NextResponse.json({
+      success: true,
+      message: "メッセージを送信しました",
+      data: response,
+      message_id: mid ?? null,
+    });
+  } catch (error) {
+    console.error("Send message error:", error);
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : "メッセージ送信に失敗しました",
+      },
+      { status: 500 }
+    );
+  }
+}

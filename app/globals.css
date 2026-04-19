@@ -1,0 +1,157 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+@layer base {
+  :root {
+    /* Green & Fresh Design System - Shopee Chat Manager */
+    --background: 0 0% 98%;
+    --foreground: 0 0% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 10%;
+
+    /* Primary: Emerald Green (#10B981 / #059669) */
+    --primary: 160 84% 39%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Primary Shades */
+    --primary-dark: 160 84% 30%;
+    --primary-light: 160 84% 50%;
+    --primary-subtle: 160 60% 96%;
+
+    --secondary: 160 10% 95%;
+    --secondary-foreground: 160 30% 30%;
+
+    --muted: 0 0% 94%;
+    --muted-foreground: 0 0% 45%;
+
+    --accent: 160 50% 90%;
+    --accent-foreground: 160 84% 35%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 160 84% 39%;
+
+    --radius: 0.75rem;
+
+    /* Green Gradients */
+    --gradient-primary: linear-gradient(135deg, #10B981, #059669);
+    --gradient-sidebar: linear-gradient(180deg, #059669 0%, #047857 100%);
+    --gradient-hero: linear-gradient(135deg, #10B981 0%, #059669 100%);
+    --gradient-card: linear-gradient(135deg, rgba(16, 185, 129, 0.08), rgba(5, 150, 105, 0.04));
+
+    /* Shadows with green tint */
+    --shadow-sm: 0 1px 3px rgba(5, 150, 105, 0.12);
+    --shadow-md: 0 4px 16px rgba(5, 150, 105, 0.16);
+    --shadow-lg: 0 8px 32px rgba(5, 150, 105, 0.2);
+    --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.06);
+
+    --sidebar-background: 160 84% 35%;
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-primary: 0 0% 100%;
+    --sidebar-primary-foreground: 160 84% 35%;
+    --sidebar-accent: 160 84% 45%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 160 84% 40%;
+    --sidebar-ring: 0 0% 100%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+  }
+}
+
+@layer utilities {
+  .gradient-primary {
+    background: linear-gradient(135deg, #10B981, #059669);
+  }
+
+  .gradient-sidebar {
+    background: linear-gradient(180deg, #10B981 0%, #059669 100%);
+  }
+
+  .gradient-hero {
+    background: linear-gradient(135deg, #10B981 0%, #059669 100%);
+  }
+
+  .gradient-card {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.08), rgba(5, 150, 105, 0.04));
+  }
+
+  .gradient-accent {
+    background: linear-gradient(135deg, #34D399, #10B981);
+  }
+
+  .shadow-card {
+    box-shadow: var(--shadow-card);
+  }
+
+  .shadow-green {
+    box-shadow: var(--shadow-md);
+  }
+
+  .shadow-green-lg {
+    box-shadow: var(--shadow-lg);
+  }
+
+  .animate-fade-in {
+    animation: fade-in 0.3s ease-in;
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--primary) / 0.3) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--primary) / 0.3);
+    border-radius: 999px;
+  }
+}
+
