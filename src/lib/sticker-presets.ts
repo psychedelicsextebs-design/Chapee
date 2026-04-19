@@ -24,6 +24,7 @@
  *
  * 【最終取得日】
  *  2026-04-19: 初期スケルトン（ID 未投入）
+ *  2026-04-19: orangutan_my_new パックの4種を投入（ありがとう/確認中/了解/お待たせしました）
  * ------------------------------------------------------------------
  */
 
@@ -44,29 +45,24 @@ export type StickerPreset = {
  */
 export const STICKER_PRESETS: StickerPreset[] = [
   {
-    label: "発送完了",
-    sticker_package_id: "",
-    sticker_id: "",
-  },
-  {
     label: "ありがとう",
-    sticker_package_id: "",
-    sticker_id: "",
+    sticker_package_id: "orangutan_my_new",
+    sticker_id: "06",
   },
   {
     label: "確認中",
-    sticker_package_id: "",
-    sticker_id: "",
+    sticker_package_id: "orangutan_my_new",
+    sticker_id: "29",
   },
   {
     label: "了解",
-    sticker_package_id: "",
-    sticker_id: "",
+    sticker_package_id: "orangutan_my_new",
+    sticker_id: "02",
   },
   {
     label: "お待たせしました",
-    sticker_package_id: "",
-    sticker_id: "",
+    sticker_package_id: "orangutan_my_new",
+    sticker_id: "03",
   },
 ];
 
