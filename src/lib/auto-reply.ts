@@ -16,6 +16,13 @@ type AutoReplyCountryCfg = {
   subAccounts?: { id: string; name: string; enabled: boolean }[];
 };
 
+/**
+ * 同一会話への自動返信クールダウン（ミリ秒）。
+ * Shopee のペナルティ期限は 12 時間のため、1 時間の安全マージンを差し引いて 11 時間に設定。
+ * この期間内に同一会話へは自動返信を発射しない（バイヤー連投時のスパム防止）。
+ */
+const AUTO_REPLY_COOLDOWN_MS = 11 * 60 * 60 * 1000;
+
 async function getSingletonAutoReplyCountries(): Promise<
   Record<string, AutoReplyCountryCfg>
 > {
@@ -93,6 +100,14 @@ export async function scheduleAutoReplyForUnread(
     // 自動返信済みならスキップ
     const lastAutoAt = doc.last_auto_reply_at;
     if (lastAutoAt instanceof Date && lastAutoAt.getTime() >= lastMsgMs) continue;
+
+    // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みならスキップ
+    if (
+      lastAutoAt instanceof Date &&
+      now - lastAutoAt.getTime() < AUTO_REPLY_COOLDOWN_MS
+    ) {
+      continue;
+    }
 
     const dueMs = lastMsgMs + triggerMs;
     const due = new Date(dueMs > now ? dueMs : now);
@@ -202,6 +217,25 @@ export async function reviewAutoReplySchedule(
     const lastAutoAt = existing.last_auto_reply_at;
     if (lastAutoAt instanceof Date && lastAutoAt.getTime() >= lastBuyerMs) return;
 
+    // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みならスキップし、
+    // 既存の保留予約もキャンセルする（バイヤー連投による短期間の連発を防ぐ）
+    const nowForCooldown = Date.now();
+    if (
+      lastAutoAt instanceof Date &&
+      nowForCooldown - lastAutoAt.getTime() < AUTO_REPLY_COOLDOWN_MS
+    ) {
+      if (existing.auto_reply_pending) {
+        await clearAutoReplySchedule(convId, shopId);
+        console.log(
+          `[auto-reply] review: cleared (cooldown ${(
+            (nowForCooldown - lastAutoAt.getTime()) /
+            3600_000
+          ).toFixed(1)}h < 11h) conv=${convId}`
+        );
+      }
+      return;
+    }
+
     // Compute correct due time from the actual buyer message timestamp
     const dueMs = lastBuyerMs + triggerHour * 60 * 60 * 1000;
     const now = Date.now();
@@ -274,6 +308,17 @@ export async function handleAutoReplyOnWebhookMessage(
   const existing = await col.findOne({ conversation_id: convId, shop_id });
   if (existing?.chat_type === "notification") return;
 
+  // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みなら予約しない
+  const lastAutoAtWebhook = (existing as unknown as {
+    last_auto_reply_at?: Date;
+  })?.last_auto_reply_at;
+  if (
+    lastAutoAtWebhook instanceof Date &&
+    Date.now() - lastAutoAtWebhook.getTime() < AUTO_REPLY_COOLDOWN_MS
+  ) {
+    return;
+  }
+
   const countries = await getSingletonAutoReplyCountries();
   const cfg = countries[countryKey];
   if (!cfg?.enabled || !cfg.template_id?.trim()) return;
@@ -325,6 +370,7 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     customer_id: number;
     auto_reply_pending?: boolean;
     auto_reply_due_at?: Date | null;
+    last_auto_reply_at?: Date | null;
     chat_type?: string;
   }>("shopee_conversations");
 
@@ -353,6 +399,9 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     /**
      * Shopee 側で手動返信済みなのに DB に予約が残っているケースを防ぐ:
      * 送信直前に生メッセージを取得し reviewAutoReplySchedule でキャンセル・再計算する。
+     *
+     * L1-C: verify 失敗は silent skip せず errors に記録し、auto_reply_pending は維持する
+     * （＝次回 cron で再試行される）。Shopee API の一時障害で送信機会を失わないため。
      */
     let accessToken: string;
     let countryKey: string;
@@ -372,8 +421,16 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
         convId
       );
     } catch (e) {
-      console.warn(`[auto-reply] pre-send verify failed conv=${convId}:`, e);
-      result.skipped++;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[auto-reply] pre-send verify failed conv=${convId} (pending preserved for retry):`,
+        msg
+      );
+      result.errors.push({
+        conversation_id: convId,
+        error: `pre-send verify failed: ${msg}`,
+      });
+      // auto_reply_pending / auto_reply_due_at は変更せず次回 cron で再試行させる
       continue;
     }
 
@@ -409,6 +466,22 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     );
 
     if (!claimed) {
+      result.skipped++;
+      continue;
+    }
+
+    // 最終セーフガード: claim 後に再度クールダウンを確認（レース条件対策）
+    const lastAutoAtFinal = claimed.last_auto_reply_at;
+    if (
+      lastAutoAtFinal instanceof Date &&
+      Date.now() - lastAutoAtFinal.getTime() < AUTO_REPLY_COOLDOWN_MS
+    ) {
+      console.log(
+        `[auto-reply] send-skip: cooldown (${(
+          (Date.now() - lastAutoAtFinal.getTime()) /
+          3600_000
+        ).toFixed(1)}h < 11h) conv=${convId}`
+      );
       result.skipped++;
       continue;
     }

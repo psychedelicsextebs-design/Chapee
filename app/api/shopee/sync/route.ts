@@ -189,8 +189,18 @@ export async function GET(request: NextRequest) {
         }
 
         let synced = 0;
-        // unread_count > 0 の会話は自動返信スケジュールの対象
-        const unreadConvIds: string[] = [];
+        /**
+         * 自動返信スケジュールの対象候補。
+         *
+         * L1-A（2026-04-19 修正）:
+         *   旧実装は `unread_count > 0` でフィルタしていたため、
+         *   webhook が取りこぼされた状態で会話が既読化されると
+         *   永久にスケジュールされず Shopee 返信期限を超過する穴があった。
+         *   既読フィルタを撤廃し、直近メッセージを持つ会話はすべて候補にする。
+         *   scheduleAutoReplyForUnread 側でスタッフ既返信・クールダウン・
+         *   last_auto_reply_at の重複を弾くため過剰発射にはならない。
+         */
+        const autoReplyCandidateIds: string[] = [];
 
         for (const conv of allConversations) {
           const lastAt = shopeeNanoTimestampToDate(conv.last_message_timestamp);
@@ -239,19 +249,30 @@ export async function GET(request: NextRequest) {
           );
           synced++;
 
-          if (conv.unread_count > 0) {
-            unreadConvIds.push(String(conv.conversation_id));
+          /**
+           * 自動返信の候補判定は scheduleAutoReplyForUnread 内の条件に委ねる。
+           * ここでは「notification は除外」だけ軽く前処理し、残りは全て渡す。
+           * クールダウン・既返信・last_auto_reply_at は下流で判定される。
+           */
+          if (chatType !== "notification") {
+            autoReplyCandidateIds.push(String(conv.conversation_id));
           }
         }
 
         console.log(`[Sync] Synced ${synced} conversations to database`);
 
-        // Webhook が届かなかった場合のフォールバック:
-        // 未読会話の自動返信スケジュールを last_message_time ベースで設定する。
-        // 生メッセージが不要な簡易版（due_at = last_message_time + triggerHour）。
-        if (unreadConvIds.length > 0) {
+        /**
+         * Webhook が届かなかった場合のフォールバック:
+         * notification 以外すべての会話を候補として last_message_time ベースで
+         * 自動返信スケジュールを設定する。生メッセージが不要な簡易版
+         * （due_at = last_message_time + triggerHour）。
+         */
+        if (autoReplyCandidateIds.length > 0) {
           try {
-            await scheduleAutoReplyForUnread(shop.shop_id, unreadConvIds);
+            await scheduleAutoReplyForUnread(
+              shop.shop_id,
+              autoReplyCandidateIds
+            );
           } catch (e) {
             console.warn("[Sync] scheduleAutoReplyForUnread:", e);
           }
