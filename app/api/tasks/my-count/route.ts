@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import { ObjectId } from "mongodb";
 import { getCollection } from "@/lib/mongodb";
 import { getSession } from "@/lib/auth";
 import { TaskDoc } from "@/lib/tasks";
 
 type StaffDoc = {
-  _id: { toString: () => string };
+  _id: ObjectId;
   email: string;
 };
 
