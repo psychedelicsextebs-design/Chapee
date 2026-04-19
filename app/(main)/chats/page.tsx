@@ -69,6 +69,8 @@ export default function ChatsPage() {
     const h = searchParams.get("handling");
     if (h === "all" || h === "") setSelectedHandling("all");
     else if (h && isHandlingStatus(h)) setSelectedHandling(h);
+    const q = searchParams.get("q");
+    if (q) setSearch(q);
   }, [searchParams]);
 
   useEffect(() => {

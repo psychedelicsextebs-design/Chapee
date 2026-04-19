@@ -308,7 +308,8 @@ export default function DashboardPage() {
 
   const dashboardRecentChats = useMemo(() => {
     const q = search.trim();
-    const list = q
+    const isSearching = Boolean(q);
+    const filtered = isSearching
       ? chatsSortedUnreadFirst.filter((c) =>
           matchChatSearchQuery(search, {
             customer: c.customer,
@@ -319,8 +320,21 @@ export default function DashboardPage() {
           })
         )
       : chatsSortedUnreadFirst;
-    return list.slice(0, 5);
+    // 検索時は最大20件、通常時は最近5件
+    const limit = isSearching ? 20 : 5;
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      isSearching,
+      limit,
+    };
   }, [chatsSortedUnreadFirst, search]);
+
+  const goToFullSearch = useCallback(() => {
+    const q = search.trim();
+    if (!q) return;
+    router.push(`/chats?q=${encodeURIComponent(q)}`);
+  }, [router, search]);
 
   const stats = [
     { label: "バイヤーチャット", value: buyerChats.length, icon: ShoppingCart, color: "text-blue-600", bg: "bg-blue-50 border-blue-200" },
@@ -388,9 +402,15 @@ export default function DashboardPage() {
         <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
         <Input
           type="search"
-          placeholder="顧客名・メッセージ・国・会話IDで検索（スペース区切りで複数キーワード可）"
+          placeholder="顧客名・メッセージ・国・会話IDで検索（Enterで全件検索へ）"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              goToFullSearch();
+            }
+          }}
           className="pl-10 h-11 rounded-xl border-gray-200 bg-white shadow-sm"
           aria-label="チャット検索"
         />
@@ -511,21 +531,47 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* 最近のチャット（簡易表示） */}
+      {/* 最近のチャット / 検索結果 */}
       <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between bg-gradient-to-r from-gray-50 to-white">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
-              <Clock size={16} className="text-primary" />
+              {dashboardRecentChats.isSearching
+                ? <Search size={16} className="text-primary" />
+                : <Clock size={16} className="text-primary" />}
             </div>
-            <p className="text-gray-900 font-bold text-base">最近のチャット</p>
+            <div className="flex flex-col">
+              <p className="text-gray-900 font-bold text-base">
+                {dashboardRecentChats.isSearching ? "検索結果" : "最近のチャット"}
+              </p>
+              {dashboardRecentChats.isSearching && (
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {dashboardRecentChats.total > dashboardRecentChats.limit
+                    ? `${dashboardRecentChats.total}件ヒット（先頭${dashboardRecentChats.limit}件を表示）`
+                    : `${dashboardRecentChats.total}件ヒット`}
+                </p>
+              )}
+            </div>
           </div>
-          <Link href="/chats">
-            <Button variant="outline" size="sm" className="gap-2 rounded-xl border-gray-200">
-              すべて見る
+          {dashboardRecentChats.isSearching ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-2 rounded-xl border-gray-200"
+              onClick={goToFullSearch}
+            >
+              全件検索へ
               <ChevronRight size={14} />
             </Button>
-          </Link>
+          ) : (
+            <Link href="/chats">
+              <Button variant="outline" size="sm" className="gap-2 rounded-xl border-gray-200">
+                すべて見る
+                <ChevronRight size={14} />
+              </Button>
+            </Link>
+          )}
         </div>
         <div className="divide-y divide-gray-100">
           {loading ? (
@@ -564,7 +610,7 @@ export default function DashboardPage() {
                 )}
               </div>
             </div>
-          ) : dashboardRecentChats.length === 0 && search.trim() ? (
+          ) : dashboardRecentChats.items.length === 0 && search.trim() ? (
             <div className="py-12 text-center text-gray-500 text-sm px-4">
               <Search className="mx-auto mb-3 text-gray-300" size={36} />
               <p className="text-gray-900 font-medium">検索に一致する会話がありません</p>
@@ -580,8 +626,8 @@ export default function DashboardPage() {
               </Button>
             </div>
           ) : (
-            // 未読優先で最大5件（ダッシュボードは概要）。検索時は条件に合うものから最大5件
-            dashboardRecentChats.map((chat, index) => {
+            // 通常時: 未読優先で最近5件。検索時: 条件一致から最大20件（上限超過は「全件検索へ」で /chats?q=... へ）
+            dashboardRecentChats.items.map((chat, index) => {
               const typeConfig = chatTypeConfig[chat.type || "buyer"];
               const TypeIcon = typeConfig.icon;
               return (
