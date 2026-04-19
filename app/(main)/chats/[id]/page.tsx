@@ -37,6 +37,7 @@ import {
   HANDLING_STATUS_LABELS,
   HANDLING_STATUS_VALUES,
 } from "@/lib/handling-status";
+import { getStickerPresetsForMarket } from "@/lib/sticker-presets";
 
 type AttachedFile = {
   id: string;
@@ -459,6 +460,12 @@ export default function ChatDetailPage() {
   const groupedReplyTemplates = useMemo(
     () => groupReplyTemplatesByCategory(replyTemplates, conversation?.country),
     [replyTemplates, conversation?.country]
+  );
+
+  /** プリセットスタンプ（`src/lib/sticker-presets.ts` で定義）。ID 未投入のプリセットは自動で除外される */
+  const stickerPresets = useMemo(
+    () => getStickerPresetsForMarket(conversation?.country),
+    [conversation?.country]
   );
 
   /** 会話内に現れたスタンプ（package_id + sticker_id）— Shopee はパック一覧 API が無いため、受信済みスタンプから返信用に使う */
@@ -1401,9 +1408,39 @@ export default function ChatDetailPage() {
               </PopoverTrigger>
               <PopoverContent
                 align="start"
-                className="w-[min(100vw-2rem,20rem)] p-3"
+                className="w-[min(100vw-2rem,22rem)] p-3"
                 sideOffset={6}
               >
+                {stickerPresets.length > 0 && (
+                  <>
+                    <p className="text-xs font-semibold text-foreground mb-2">
+                      よく使うスタンプ
+                    </p>
+                    <ul className="grid grid-cols-3 gap-2 mb-3">
+                      {stickerPresets.map((p) => (
+                        <li
+                          key={`preset:${p.sticker_package_id}:${p.sticker_id}`}
+                        >
+                          <button
+                            type="button"
+                            disabled={sending}
+                            onClick={() =>
+                              void handleSendSticker(
+                                p.sticker_package_id,
+                                p.sticker_id
+                              )
+                            }
+                            className="w-full aspect-square rounded-lg border border-primary/30 bg-primary-subtle hover:bg-primary-subtle/70 hover:border-primary/60 transition-colors flex items-center justify-center p-2 text-xs font-semibold text-primary leading-tight text-center"
+                            title={`「${p.label}」を送信`}
+                          >
+                            {p.label}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="border-t border-border mb-3" />
+                  </>
+                )}
                 <p className="text-xs font-semibold text-foreground mb-2">
                   会話内のスタンプで返信
                 </p>
@@ -1422,7 +1459,7 @@ export default function ChatDetailPage() {
                             void handleSendSticker(s.package_id, s.sticker_id)
                           }
                           className="w-full aspect-square rounded-lg border border-border bg-muted/40 hover:bg-muted hover:border-primary/50 transition-colors flex items-center justify-center p-1 overflow-hidden"
-                          title="このスタンプを送信"
+                          title={`このスタンプを送信 (pkg: ${s.package_id}, id: ${s.sticker_id})`}
                         >
                           {s.image_url ? (
                             <img
