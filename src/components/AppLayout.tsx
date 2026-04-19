@@ -19,6 +19,12 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import HeaderNotificationCenter from "@/components/HeaderNotificationCenter";
 
 // Project assets from /public
@@ -100,41 +106,55 @@ function SidebarContent({
       </div>
 
       {/* Navigation with Modern Style */}
-      <nav className={cn("flex-1 py-2 space-y-1.5 overflow-y-hidden", "px-3")}>
-        {navItems.map(({ icon: Icon, label, path }) => {
-          const active = pathname === path || (path === "/dashboard" && pathname === "/");
-          return (
-            <Link
-              key={path}
-              href={path}
-              onClick={onNavClick}
-              className={cn(
-                "flex items-center gap-3 rounded-2xl transition-all duration-200 group min-h-[48px] relative overflow-hidden",
-                collapsed ? "justify-center px-3 py-3" : "px-4 py-3",
-                active
-                  ? "bg-white text-primary shadow-lg"
-                  : "text-white/80 hover:bg-white/10 hover:text-white"
-              )}
-            >
-              <Icon size={20} className="flex-shrink-0 relative z-10" />
-              {path === "/tasks" && collapsed && (
-                <NavBadge count={myTaskCount} collapsed />
-              )}
-              {!collapsed && (
-                <>
-                  <span className="text-sm font-semibold animate-fade-in relative z-10">{label}</span>
-                  {path === "/tasks" && (
-                    <NavBadge count={myTaskCount} collapsed={false} />
-                  )}
-                  {active && path !== "/tasks" && (
-                    <div className="absolute right-4 w-2 h-2 rounded-full bg-primary animate-pulse" />
-                  )}
-                </>
-              )}
-            </Link>
-          );
-        })}
-      </nav>
+      <TooltipProvider delayDuration={500}>
+        <nav className={cn("flex-1 py-2 space-y-1.5 overflow-y-hidden", "px-3")}>
+          {navItems.map(({ icon: Icon, label, path }) => {
+            const active = pathname === path || (path === "/dashboard" && pathname === "/");
+            const linkEl = (
+              <Link
+                key={path}
+                href={path}
+                onClick={onNavClick}
+                aria-label={label}
+                className={cn(
+                  "flex items-center gap-3 rounded-2xl transition-all duration-200 group min-h-[48px] relative overflow-hidden",
+                  collapsed ? "justify-center px-3 py-3" : "px-4 py-3",
+                  active
+                    ? "bg-white text-primary shadow-lg"
+                    : "text-white/80 hover:bg-white/10 hover:text-white"
+                )}
+              >
+                <Icon size={20} className="flex-shrink-0 relative z-10" />
+                {path === "/tasks" && collapsed && (
+                  <NavBadge count={myTaskCount} collapsed />
+                )}
+                {!collapsed && (
+                  <>
+                    <span className="text-sm font-semibold animate-fade-in relative z-10">{label}</span>
+                    {path === "/tasks" && (
+                      <NavBadge count={myTaskCount} collapsed={false} />
+                    )}
+                    {active && path !== "/tasks" && (
+                      <div className="absolute right-4 w-2 h-2 rounded-full bg-primary animate-pulse" />
+                    )}
+                  </>
+                )}
+              </Link>
+            );
+            // サイドバー折りたたみ時のみ、横にラベルを浮かべるツールチップを表示
+            return collapsed ? (
+              <Tooltip key={path}>
+                <TooltipTrigger asChild>{linkEl}</TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8} className="font-medium">
+                  {label}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              linkEl
+            );
+          })}
+        </nav>
+      </TooltipProvider>
 
       {/* User Section with Card Style */}
       <div className={cn("p-3 bg-white/10 backdrop-blur-sm rounded-2xl border border-white/20", collapsed ? "m-2" : "m-2")}>
@@ -163,18 +183,27 @@ function SidebarContent({
             <span className="text-sm font-medium">{loggingOut ? "ログアウト中..." : "ログアウト"}</span>
           </button>
         ) : (
-          <button
-            type="button"
-            onClick={() => {
-              onNavClick?.();
-              onLogout();
-            }}
-            disabled={loggingOut}
-            className="flex items-center justify-center mt-2 p-2.5 rounded-xl text-white/80 hover:text-white hover:bg-white/10 transition-all w-full min-h-[44px]"
-            aria-label="ログアウト"
-          >
-            <LogOut size={18} />
-          </button>
+          <TooltipProvider delayDuration={500}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onNavClick?.();
+                    onLogout();
+                  }}
+                  disabled={loggingOut}
+                  className="flex items-center justify-center mt-2 p-2.5 rounded-xl text-white/80 hover:text-white hover:bg-white/10 transition-all w-full min-h-[44px]"
+                  aria-label="ログアウト"
+                >
+                  <LogOut size={18} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right" sideOffset={8} className="font-medium">
+                {loggingOut ? "ログアウト中..." : "ログアウト"}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         )}
       </div>
     </>
