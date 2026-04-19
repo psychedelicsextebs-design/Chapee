@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   Settings,
+  ListTodo,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
@@ -26,6 +27,7 @@ const APP_LOGO = "/logo.png";
 const navItems = [
   { icon: LayoutDashboard, label: "ダッシュボード", path: "/dashboard" },
   { icon: MessageSquare, label: "チャット管理", path: "/chats" },
+  { icon: ListTodo, label: "タスク管理", path: "/tasks" },
   { icon: FileText, label: "テンプレート", path: "/templates" },
   { icon: Zap, label: "自動返信設定", path: "/auto-reply" },
   { icon: Users, label: "担当者管理", path: "/staff" },
