@@ -40,3 +40,6 @@ coverage
 
 # Vercel / deployment
 .vercel
+
+# Auto-reply 被害リスト出力（顧客情報が含まれるためコミットしない）
+scripts/auto-reply-victims.json
