@@ -8,6 +8,57 @@ import {
 } from "@/lib/staff-message-kind";
 import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
 
+/**
+ * Pure helper (testable): classify a single Shopee chat message as buyer vs. staff.
+ *
+ * Why not just `from_id === shop_id`:
+ *   Shopee Seller Center (sub-accounts / mobile app / CS agents) sends with
+ *   `from_id = staff user_id`, NOT `shop_id`. The old check mis-labelled those
+ *   as buyer messages and the auto-reply fired 11h after a staff reply.
+ *
+ * The only reliable signal we always have is `customer_id` (the buyer's Shopee
+ * user id, persisted on the conversation doc). Any message whose `from_id`
+ * does NOT equal `customer_id` is therefore a shop-side (staff) message.
+ *
+ * Returns "unknown" when `from_id` is 0/missing (system cards etc.) — callers
+ * should ignore those entries rather than treating them as either side.
+ */
+export function classifyShopeeMessageSender(
+  msg: Record<string, unknown>,
+  customerId: number
+): "buyer" | "staff" | "unknown" {
+  const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
+  if (!Number.isFinite(fromId) || fromId === 0) return "unknown";
+  const buyer = Number(customerId);
+  if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) return "buyer";
+  return "staff";
+}
+
+/**
+ * Pure helper (testable): walk raw messages and return the latest buyer/staff
+ * timestamps (ms since epoch, 0 if none).
+ */
+export function computeBuyerStaffLastMs(
+  rawMessages: Record<string, unknown>[],
+  customerId: number
+): { lastBuyerMs: number; lastStaffMs: number } {
+  let lastBuyerMs = 0;
+  let lastStaffMs = 0;
+  for (const msg of rawMessages) {
+    const kind = classifyShopeeMessageSender(msg, customerId);
+    if (kind === "unknown") continue;
+    const ts = shopeeMessageTimeToMs(
+      msg.timestamp ?? msg.created_timestamp ?? msg.time
+    );
+    if (kind === "buyer") {
+      if (ts > lastBuyerMs) lastBuyerMs = ts;
+    } else {
+      if (ts > lastStaffMs) lastStaffMs = ts;
+    }
+  }
+  return { lastBuyerMs, lastStaffMs };
+}
+
 /** Mirrors `AutoReplyCountryStored` in settings API */
 type AutoReplyCountryCfg = {
   enabled: boolean;
@@ -72,6 +123,7 @@ export async function scheduleAutoReplyForUnread(
   const col = await getCollection<{
     conversation_id: string;
     shop_id: number;
+    customer_id?: number;
     chat_type?: string;
     last_message_time?: Date;
     auto_reply_pending?: boolean;
@@ -91,6 +143,15 @@ export async function scheduleAutoReplyForUnread(
     if (doc.chat_type === "notification") continue;
     // 既にスケジュール済みならスキップ
     if (doc.auto_reply_pending && doc.auto_reply_due_at) continue;
+
+    // 安全ガード: customer_id が未同期なら誰が送ったか判定できないので送らない
+    const customerId = Number(doc.customer_id ?? 0);
+    if (!Number.isFinite(customerId) || customerId <= 0) {
+      console.warn(
+        `[auto-reply] sync-fallback: skipped (customer_id 未同期) conv=${doc.conversation_id} shop=${shopId}`
+      );
+      continue;
+    }
 
     const lastMsgMs = doc.last_message_time instanceof Date
       ? doc.last_message_time.getTime()
@@ -165,6 +226,7 @@ export async function reviewAutoReplySchedule(
       conversation_id: string;
       shop_id: number;
       country?: string;
+      customer_id?: number;
       chat_type?: string;
       auto_reply_pending?: boolean;
       auto_reply_due_at?: Date | null;
@@ -174,6 +236,19 @@ export async function reviewAutoReplySchedule(
     const existing = await col.findOne({ conversation_id: convId, shop_id: shopId });
     if (!existing) return;
     if (existing.chat_type === "notification") return;
+
+    // 安全ガード: customer_id が未同期なら誰が買い手か判定できない → 送らない
+    // (誤送信 > 送信漏れ の方針で保守的に倒す)
+    const customerId = Number(existing.customer_id ?? 0);
+    if (!Number.isFinite(customerId) || customerId <= 0) {
+      if (existing.auto_reply_pending) {
+        await clearAutoReplySchedule(convId, shopId);
+      }
+      console.warn(
+        `[auto-reply] review: skipped (customer_id 未同期) conv=${convId} shop=${shopId}`
+      );
+      return;
+    }
 
     const country = (await getShopCountry(shopId)) ?? existing.country ?? "SG";
     const countryKey = String(country).toUpperCase();
@@ -189,20 +264,22 @@ export async function reviewAutoReplySchedule(
 
     const triggerHour = Math.max(1, Number(cfg.triggerHour) || 1);
 
-    // Determine last buyer and last staff message timestamps from the raw list
-    let lastBuyerMs = 0;
-    let lastStaffMs = 0;
-    for (const msg of rawMessages) {
-      const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
-      const ts = shopeeMessageTimeToMs(msg.timestamp ?? msg.created_timestamp ?? msg.time);
-      if (fromId === shopId) {
-        if (ts > lastStaffMs) lastStaffMs = ts;
-      } else if (fromId > 0) {
-        if (ts > lastBuyerMs) lastBuyerMs = ts;
-      }
-    }
+    // Determine last buyer / last staff timestamps from the raw list.
+    // Staff detection is NOT just `from_id === shop_id` — Shopee Seller Center
+    // sub-account / mobile / CS-agent messages arrive with the staff's personal
+    // user_id. Anything that isn't from customer_id is staff-side.
+    const { lastBuyerMs, lastStaffMs } = computeBuyerStaffLastMs(
+      rawMessages,
+      customerId
+    );
 
-    if (lastBuyerMs === 0) return; // no identifiable buyer messages
+    if (lastBuyerMs === 0) {
+      // No buyer activity at all → nothing to auto-reply to.
+      if (existing.auto_reply_pending) {
+        await clearAutoReplySchedule(convId, shopId);
+      }
+      return;
+    }
 
     // Staff has already replied after the last buyer message → cancel
     if (lastStaffMs >= lastBuyerMs) {
@@ -277,13 +354,16 @@ type WebhookMsg = {
 
 /**
  * Webhook: バイヤーからのメッセージで自動返信を予約、店舗からならキャンセル。
+ *
+ * スタッフ判定は `from_id === shop_id` では不十分（セラーセンターのサブアカウント
+ * 等は `from_id = 個人user_id`）。 DB に保存済みの `customer_id` と `from_id` が
+ * 一致したときだけバイヤーからの着信として扱い、それ以外はスタッフ送信と判定する。
  */
 export async function handleAutoReplyOnWebhookMessage(
   data: WebhookMsg
 ): Promise<void> {
-  const { shop_id, conversation_id, to_id, to_name, from_id } = data;
+  const { shop_id, conversation_id, from_id } = data;
   const convId = String(conversation_id);
-  const isStaff = Number(from_id) === Number(shop_id);
 
   const col = await getCollection<{
     conversation_id: string;
@@ -292,26 +372,39 @@ export async function handleAutoReplyOnWebhookMessage(
     customer_id?: number;
     chat_type?: string;
     customer_name?: string;
+    last_auto_reply_at?: Date;
   }>("shopee_conversations");
-
-  if (isStaff) {
-    await clearAutoReplySchedule(convId, shop_id);
-    return;
-  }
-
-  const existingCountry = (await col.findOne({ conversation_id: convId, shop_id }))
-    ?.country;
-  const country =
-    (await getShopCountry(shop_id)) ?? existingCountry ?? "SG";
-  const countryKey = String(country).toUpperCase();
 
   const existing = await col.findOne({ conversation_id: convId, shop_id });
   if (existing?.chat_type === "notification") return;
 
+  const customerId = Number(existing?.customer_id ?? 0);
+  const fromIdNum = Number(from_id);
+
+  // customer_id が未同期 → 判定不能なので保守的に送らない（pending もクリア）
+  if (!Number.isFinite(customerId) || customerId <= 0) {
+    await clearAutoReplySchedule(convId, shop_id);
+    console.warn(
+      `[auto-reply] webhook: skipped (customer_id 未同期) conv=${convId} shop=${shop_id}`
+    );
+    return;
+  }
+
+  // バイヤー以外（shop 本体でもサブアカウントでも）の送信ならスケジュールをキャンセル
+  const isBuyerMessage =
+    Number.isFinite(fromIdNum) && fromIdNum > 0 && fromIdNum === customerId;
+  if (!isBuyerMessage) {
+    await clearAutoReplySchedule(convId, shop_id);
+    return;
+  }
+
+  const existingCountry = existing?.country;
+  const country =
+    (await getShopCountry(shop_id)) ?? existingCountry ?? "SG";
+  const countryKey = String(country).toUpperCase();
+
   // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みなら予約しない
-  const lastAutoAtWebhook = (existing as unknown as {
-    last_auto_reply_at?: Date;
-  })?.last_auto_reply_at;
+  const lastAutoAtWebhook = existing?.last_auto_reply_at;
   if (
     lastAutoAtWebhook instanceof Date &&
     Date.now() - lastAutoAtWebhook.getTime() < AUTO_REPLY_COOLDOWN_MS
@@ -396,6 +489,17 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       continue;
     }
 
+    // customer_id が未同期 → 判定不能なので送らない
+    const customerIdNum = Number(doc.customer_id ?? 0);
+    if (!Number.isFinite(customerIdNum) || customerIdNum <= 0) {
+      await clearAutoReplySchedule(convId, shopId);
+      console.warn(
+        `[auto-reply] pre-send: skipped (customer_id 未同期) conv=${convId} shop=${shopId}`
+      );
+      result.skipped++;
+      continue;
+    }
+
     /**
      * Shopee 側で手動返信済みなのに DB に予約が残っているケースを防ぐ:
      * 送信直前に生メッセージを取得し reviewAutoReplySchedule でキャンセル・再計算する。
@@ -405,21 +509,18 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
      */
     let accessToken: string;
     let countryKey: string;
+    let rawList: Record<string, unknown>[] = [];
     try {
       accessToken = await getValidToken(shopId);
       const countryResolved = await resolveCountryForShop(shopId, doc.country);
       countryKey = String(countryResolved).toUpperCase();
-      const rawList = await fetchAllConversationMessages(
+      rawList = (await fetchAllConversationMessages(
         accessToken,
         shopId,
         convId,
         { country: countryResolved }
-      );
-      await reviewAutoReplySchedule(
-        rawList as Record<string, unknown>[],
-        shopId,
-        convId
-      );
+      )) as Record<string, unknown>[];
+      await reviewAutoReplySchedule(rawList, shopId, convId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(
@@ -444,6 +545,23 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       !(afterReview.auto_reply_due_at instanceof Date) ||
       afterReview.auto_reply_due_at.getTime() > nowSend.getTime()
     ) {
+      result.skipped++;
+      continue;
+    }
+
+    /**
+     * 送信直前の最終ガード（防御多重化）:
+     * review ロジックに将来バグが入っても誤送信が発生しないよう、ここで独立に
+     * 「最新メッセージが buyer からの送信であること」を直接検査する。
+     * buyer ではない（= スタッフ側からの送信）なら送らずキャンセル。
+     */
+    const { lastBuyerMs: guardBuyerMs, lastStaffMs: guardStaffMs } =
+      computeBuyerStaffLastMs(rawList, customerIdNum);
+    if (guardBuyerMs === 0 || guardStaffMs >= guardBuyerMs) {
+      await clearAutoReplySchedule(convId, shopId);
+      console.log(
+        `[auto-reply] pre-send guard: cancelled (latest is staff or no buyer msg) conv=${convId} shop=${shopId}`
+      );
       result.skipped++;
       continue;
     }
