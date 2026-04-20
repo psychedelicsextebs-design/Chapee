@@ -5,6 +5,7 @@ import {
   resolveShopeeWebhookUrl,
   verifyShopeeWebhookSignature,
 } from "@/lib/shopee-webhook-auth";
+import { recordWebhookObservation } from "@/lib/webhook-observation-log";
 
 /**
  * Shopee Webhook Receiver
@@ -37,15 +38,16 @@ export async function POST(request: NextRequest) {
 
     // --- 署名検証（SHOPEE_PARTNER_KEY 設定時のみ） ---
     const partnerKey = process.env.SHOPEE_PARTNER_KEY?.trim() ?? "";
+    let signatureValid = false;
     if (partnerKey) {
       const url = resolveShopeeWebhookUrl(request.url);
-      const ok = verifyShopeeWebhookSignature({
+      signatureValid = verifyShopeeWebhookSignature({
         url,
         rawBody,
         authorizationHeader: request.headers.get("authorization"),
         partnerKey,
       });
-      if (!ok) {
+      if (!signatureValid) {
         console.warn(
           `[Webhook] signature verification FAILED url=${url} bodyLen=${rawBody.length}`
         );
@@ -55,9 +57,10 @@ export async function POST(request: NextRequest) {
       console.warn(
         "[Webhook] SHOPEE_PARTNER_KEY unset — signature verification SKIPPED (dev only)"
       );
+      signatureValid = false;
     }
 
-    let payload: { code?: number; data?: Record<string, unknown> };
+    let payload: { code?: number; shop_id?: number; data?: Record<string, unknown> };
     try {
       payload = JSON.parse(rawBody);
     } catch (e) {
@@ -65,8 +68,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
     }
 
+    const pushCode = Number(payload.code ?? 0);
+    const shopId = Number(
+      payload.shop_id ??
+        (payload.data as Record<string, unknown> | undefined)?.shop_id ??
+        0
+    );
+
     // Handle different webhook events（Push Code は Shopee コンソールの表に従う）
-    switch (payload.code) {
+    switch (pushCode) {
       case 10: // webchat_push
         await handleNewMessage(payload.data ?? {});
         break;
@@ -75,11 +85,25 @@ export async function POST(request: NextRequest) {
         console.log("[Webhook] Shop authorization");
         break;
 
-      case 3: // order_status_push（Phase 1: observation-only handler は後続 commit で追加）
+      case 3: // order_status_push → Phase 1 observation-only
+        await handleOrderStatusPushObserveOnly(payload, signatureValid);
+        break;
+
+      case 4: // order_trackingno_push → Phase 1 observation-only
+        await handleOrderTrackingNoPushObserveOnly(payload, signatureValid);
         break;
 
       default:
-        console.log("[Webhook] Unknown event code:", payload.code);
+        // 未対応 code も観察ログに残す（Shopee が将来追加する push を把握するため）
+        console.log("[Webhook] Unhandled event code:", pushCode);
+        await recordWebhookObservation({
+          code: pushCode,
+          shop_id: Number.isFinite(shopId) && shopId > 0 ? shopId : undefined,
+          raw_payload: payload as unknown as Record<string, unknown>,
+          signature_valid: signatureValid,
+          processed: false,
+          note: "unhandled_code",
+        });
     }
 
     return NextResponse.json({ message: "OK" }, { status: 200 });
@@ -90,6 +114,76 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+/**
+ * Phase 1 observation-only: order_status_push の実 payload 構造を採取する。
+ *
+ * このハンドラは **絶対に** 以下を行わない:
+ *   - event_triggered_messages への書き込み
+ *   - メッセージ送信
+ *   - 既存 auto-reply の state 変更
+ *
+ * 純粋に実 payload を webhook_observation_log に保存 + console.log で垂れ流すだけ。
+ * Phase 2 でこの観察データを元に消費ロジックを書く。
+ */
+async function handleOrderStatusPushObserveOnly(
+  payload: Record<string, unknown>,
+  signatureValid: boolean
+): Promise<void> {
+  const data = (payload.data as Record<string, unknown> | undefined) ?? {};
+  const shopId = Number(
+    payload.shop_id ?? data.shop_id ?? 0
+  );
+  const ordersn = String(data.ordersn ?? data.order_sn ?? "");
+  const status = String(data.status ?? data.order_status ?? "");
+
+  console.log(
+    `[Webhook][observe][order_status_push] shop=${shopId} ordersn=${ordersn} status=${status}`,
+    JSON.stringify(payload)
+  );
+
+  await recordWebhookObservation({
+    code: 3,
+    shop_id: Number.isFinite(shopId) && shopId > 0 ? shopId : undefined,
+    raw_payload: payload,
+    signature_valid: signatureValid,
+    processed: false,
+    note: "order_status_push",
+  });
+}
+
+/**
+ * Phase 1 observation-only: order_trackingno_push の実 payload 構造を採取する。
+ * 特に `tracking_no` フィールドが payload に含まれているかを確認したい
+ * （Shopee docs と実配信がずれるケースがある）。
+ */
+async function handleOrderTrackingNoPushObserveOnly(
+  payload: Record<string, unknown>,
+  signatureValid: boolean
+): Promise<void> {
+  const data = (payload.data as Record<string, unknown> | undefined) ?? {};
+  const shopId = Number(
+    payload.shop_id ?? data.shop_id ?? 0
+  );
+  const ordersn = String(data.ordersn ?? data.order_sn ?? "");
+  const trackingNo = String(
+    data.tracking_no ?? data.tracking_number ?? ""
+  );
+
+  console.log(
+    `[Webhook][observe][order_trackingno_push] shop=${shopId} ordersn=${ordersn} tracking_no=${trackingNo || "<missing>"}`,
+    JSON.stringify(payload)
+  );
+
+  await recordWebhookObservation({
+    code: 4,
+    shop_id: Number.isFinite(shopId) && shopId > 0 ? shopId : undefined,
+    raw_payload: payload,
+    signature_valid: signatureValid,
+    processed: false,
+    note: trackingNo ? "trackingno_push_with_no" : "trackingno_push_missing_no",
+  });
 }
 
 function numU(v: unknown): number {
