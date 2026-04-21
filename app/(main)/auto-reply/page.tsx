@@ -419,24 +419,29 @@ export default function AutoReplyPage() {
               本文はテンプレート画面で編集すると、ここでも次回読み込み時に反映されます。自動送信の実行は別途バックエンド連携が必要です。
             </p>
           </div>
+        </div>
 
-          <div className="flex justify-end pt-2">
-            <Button
-              type="button"
-              onClick={save}
-              disabled={saving}
-              className="rounded-xl px-6"
-            >
-              {saving ? (
-                <>
-                  <Loader2 className="animate-spin size-4 mr-2" />
-                  保存中…
-                </>
-              ) : (
-                "設定を保存"
-              )}
-            </Button>
-          </div>
+        {/*
+          「設定を保存」ボタンは OFF トグル時にもクリック可能でなければならない。
+          上の設定パネルは cfg.enabled===false のとき pointer-events-none になるため、
+          その外側(このカード直下)にボタンを置く。
+        */}
+        <div className="flex justify-end px-5 pb-5 pt-2 border-t border-gray-100 bg-gray-50/30">
+          <Button
+            type="button"
+            onClick={save}
+            disabled={saving}
+            className="rounded-xl px-6"
+          >
+            {saving ? (
+              <>
+                <Loader2 className="animate-spin size-4 mr-2" />
+                保存中…
+              </>
+            ) : (
+              "設定を保存"
+            )}
+          </Button>
         </div>
       </div>
     </div>
