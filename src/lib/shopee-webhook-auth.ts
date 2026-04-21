@@ -8,7 +8,9 @@ import crypto from "crypto";
  *
  *   - url は Shopee コンソールで登録したコールバック URL（full URL, スキーム・パス含む）
  *   - raw_body_string は JSON.stringify 前の **素の** body 文字列
- *   - partner_key は SHOPEE_PARTNER_KEY 環境変数
+ *   - partner_key は SHOPEE_LIVE_PUSH_PARTNER_KEY (推奨) または SHOPEE_PARTNER_KEY (後方互換)
+ *     から webhook/route.ts 側で解決する。本ライブラリは key 自体を env から読まず、
+ *     呼び出し側で決定された値を partnerKey 引数で受け取る。
  *
  * Shopee は大文字小文字の揺れがあるため、比較は lower-case で行う。
  * タイミングアタック対策に `timingSafeEqual` を使用。

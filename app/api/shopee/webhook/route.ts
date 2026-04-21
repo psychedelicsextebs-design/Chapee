@@ -42,7 +42,16 @@ export async function POST(request: NextRequest) {
     // Shopee Open Platform console の「Verify」テスト push は署名を付けずに送ってくる
     // 場合があるため、「署名なし/不一致」でも 200 を返して reachability 確認を通す。
     // 代わりに、実処理は必ず signatureValid === true のブロックでのみ行う。
-    const partnerKey = process.env.SHOPEE_PARTNER_KEY?.trim() ?? "";
+    //
+    // Live Push 受信の署名検証は、Shopee Open Platform が別途発行する
+    // "Live Push Partner Key" を使うのが仕様。これは SHOPEE_PARTNER_KEY
+    // (アプリ全体のマスターキー = API 呼び出し署名用) とは別物。
+    // 未設定時は後方互換として SHOPEE_PARTNER_KEY にフォールバックする
+    // (まだ Live Push を有効化していない dev/preview 環境のため)。
+    const partnerKey =
+      process.env.SHOPEE_LIVE_PUSH_PARTNER_KEY?.trim() ||
+      process.env.SHOPEE_PARTNER_KEY?.trim() ||
+      "";
     const verifyUrl = resolveShopeeWebhookUrl(request.url);
     let signatureValid = false;
     let verifyReason:
