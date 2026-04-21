@@ -8,8 +8,8 @@ import type { ObjectId } from "mongodb";
  *   - 別フラグ (既存 auto_reply_pending / last_auto_reply_at とは独立)
  *   - 別トリガー (Shopee 注文ライフサイクルの Push Code 3 / 4)
  *
- * 既存の auto-reply クールダウン (AUTO_REPLY_COOLDOWN_MS) や customer_id 判定
- * ロジックは import しないことで、相互干渉を構造的に防ぐ。
+ * 既存の auto-reply のスタッフ応答判定 / customer_id 判定ロジックは import しない
+ * ことで、相互干渉を構造的に防ぐ。
  */
 
 export type EventType =

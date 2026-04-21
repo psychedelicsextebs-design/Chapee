@@ -67,13 +67,6 @@ type AutoReplyCountryCfg = {
   subAccounts?: { id: string; name: string; enabled: boolean }[];
 };
 
-/**
- * 同一会話への自動返信クールダウン（ミリ秒）。
- * Shopee のペナルティ期限は 12 時間のため、1 時間の安全マージンを差し引いて 11 時間に設定。
- * この期間内に同一会話へは自動返信を発射しない（バイヤー連投時のスパム防止）。
- */
-const AUTO_REPLY_COOLDOWN_MS = 11 * 60 * 60 * 1000;
-
 async function getSingletonAutoReplyCountries(): Promise<
   Record<string, AutoReplyCountryCfg>
 > {
@@ -97,10 +90,20 @@ async function resolveTemplateContent(templateId: string): Promise<string | null
 
 /**
  * /api/shopee/sync のフォールバック用。
- * 生メッセージが取得できない状況で、unread_count > 0 の会話に対して
- * last_message_time + triggerHour を due_at としてセットする。
- * - 既に auto_reply_pending=true かつ due_at が設定済みの場合はスキップ（上書きしない）。
- * - last_auto_reply_at がバイヤー最終メッセージより後の場合もスキップ。
+ *
+ * 未読会話 ID リストを受け取り、 `last_message_time` が `(triggerHour - 1h)` 以内の
+ * 会話のみ生メッセージを Shopee API から取得して reviewAutoReplySchedule に委譲する。
+ *
+ * 設計:
+ *   - 判定ロジックは review / webhook / chats-messages と完全に同一
+ *     （「M_latest 以降にスタッフ(手動/自動/テンプレ/スタンプ/商品カード)応答があれば
+ *       auto-reply しない」）。これにより metadata 推定による誤射（22:30 バースト）を
+ *     根本的に止める。
+ *   - API コスト削減のため、カバレッジ窓 = max(1, triggerHour - 1) 時間より古い
+ *     会話は raw fetch しない。新規バイヤー活動があれば last_message_time が
+ *     更新されて窓内に戻るため、活動再開時は正常に発火する。
+ *   - customer_id / template / enabled などの各種ガードは review 側に集約済み。
+ *     この関数では disabled のときに fetch 自体を省略する早期リターンのみ行う。
  */
 export async function scheduleAutoReplyForUnread(
   shopId: number,
@@ -113,73 +116,61 @@ export async function scheduleAutoReplyForUnread(
   const countries = await getSingletonAutoReplyCountries();
   const cfg = countries[countryKey];
 
-  if (!cfg?.enabled || !cfg.template_id?.trim() || !ObjectId.isValid(cfg.template_id.trim())) {
+  if (
+    !cfg?.enabled ||
+    !cfg.template_id?.trim() ||
+    !ObjectId.isValid(cfg.template_id.trim())
+  ) {
     return;
   }
 
   const triggerHour = Math.max(1, Number(cfg.triggerHour) || 1);
-  const triggerMs = triggerHour * 60 * 60 * 1000;
+  const coverageMs = Math.max(1, triggerHour - 1) * 60 * 60 * 1000;
+  const cutoff = new Date(Date.now() - coverageMs);
 
   const col = await getCollection<{
     conversation_id: string;
     shop_id: number;
-    customer_id?: number;
-    chat_type?: string;
     last_message_time?: Date;
-    auto_reply_pending?: boolean;
-    auto_reply_due_at?: Date | null;
-    last_auto_reply_at?: Date | null;
   }>("shopee_conversations");
 
-  const docs = await col
+  const candidates = await col
     .find({
       conversation_id: { $in: conversationIds },
       shop_id: shopId,
+      last_message_time: { $gte: cutoff },
     })
     .toArray();
 
-  const now = Date.now();
-  for (const doc of docs) {
-    if (doc.chat_type === "notification") continue;
-    // 既にスケジュール済みならスキップ
-    if (doc.auto_reply_pending && doc.auto_reply_due_at) continue;
+  if (!candidates.length) return;
 
-    // 安全ガード: customer_id が未同期なら誰が送ったか判定できないので送らない
-    const customerId = Number(doc.customer_id ?? 0);
-    if (!Number.isFinite(customerId) || customerId <= 0) {
+  let accessToken: string;
+  try {
+    accessToken = await getValidToken(shopId);
+  } catch (e) {
+    console.warn(
+      `[auto-reply] sync-fallback: token fetch failed shop=${shopId}:`,
+      e
+    );
+    return;
+  }
+
+  for (const doc of candidates) {
+    const convId = String(doc.conversation_id);
+    try {
+      const rawList = (await fetchAllConversationMessages(
+        accessToken,
+        shopId,
+        convId,
+        { country }
+      )) as Record<string, unknown>[];
+      await reviewAutoReplySchedule(rawList, shopId, convId);
+    } catch (e) {
       console.warn(
-        `[auto-reply] sync-fallback: skipped (customer_id 未同期) conv=${doc.conversation_id} shop=${shopId}`
+        `[auto-reply] sync-fallback: review failed conv=${convId} shop=${shopId}:`,
+        e
       );
-      continue;
     }
-
-    const lastMsgMs = doc.last_message_time instanceof Date
-      ? doc.last_message_time.getTime()
-      : 0;
-    if (lastMsgMs === 0) continue;
-
-    // 自動返信済みならスキップ
-    const lastAutoAt = doc.last_auto_reply_at;
-    if (lastAutoAt instanceof Date && lastAutoAt.getTime() >= lastMsgMs) continue;
-
-    // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みならスキップ
-    if (
-      lastAutoAt instanceof Date &&
-      now - lastAutoAt.getTime() < AUTO_REPLY_COOLDOWN_MS
-    ) {
-      continue;
-    }
-
-    const dueMs = lastMsgMs + triggerMs;
-    const due = new Date(dueMs > now ? dueMs : now);
-
-    await col.updateOne(
-      { conversation_id: doc.conversation_id, shop_id: shopId },
-      { $set: { auto_reply_pending: true, auto_reply_due_at: due, updated_at: new Date() } }
-    );
-    console.log(
-      `[auto-reply] sync-fallback: scheduled conv=${doc.conversation_id} shop=${shopId} due=${due.toISOString()}`
-    );
   }
 }
 
@@ -294,29 +285,12 @@ export async function reviewAutoReplySchedule(
     const lastAutoAt = existing.last_auto_reply_at;
     if (lastAutoAt instanceof Date && lastAutoAt.getTime() >= lastBuyerMs) return;
 
-    // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みならスキップし、
-    // 既存の保留予約もキャンセルする（バイヤー連投による短期間の連発を防ぐ）
-    const nowForCooldown = Date.now();
-    if (
-      lastAutoAt instanceof Date &&
-      nowForCooldown - lastAutoAt.getTime() < AUTO_REPLY_COOLDOWN_MS
-    ) {
-      if (existing.auto_reply_pending) {
-        await clearAutoReplySchedule(convId, shopId);
-        console.log(
-          `[auto-reply] review: cleared (cooldown ${(
-            (nowForCooldown - lastAutoAt.getTime()) /
-            3600_000
-          ).toFixed(1)}h < 11h) conv=${convId}`
-        );
-      }
-      return;
-    }
-
     // Compute correct due time from the actual buyer message timestamp
     const dueMs = lastBuyerMs + triggerHour * 60 * 60 * 1000;
     const now = Date.now();
-    // If already past due, schedule for the next cron tick
+    // Note: 過去 due を now に丸める挙動は歴史的経緯で残している。
+    // pre-send guard (スタッフ応答の再検証) で誤送信は止まるため実害なし。
+    // 将来的に、新規予約のみ時刻を保持する形にリファクタすべき。
     const due = new Date(dueMs > now ? dueMs : now);
 
     // Skip write if already scheduled with the same due time (±1 min tolerance)
@@ -402,15 +376,6 @@ export async function handleAutoReplyOnWebhookMessage(
   const country =
     (await getShopCountry(shop_id)) ?? existingCountry ?? "SG";
   const countryKey = String(country).toUpperCase();
-
-  // クールダウン: 直近 AUTO_REPLY_COOLDOWN_MS 以内に自動返信済みなら予約しない
-  const lastAutoAtWebhook = existing?.last_auto_reply_at;
-  if (
-    lastAutoAtWebhook instanceof Date &&
-    Date.now() - lastAutoAtWebhook.getTime() < AUTO_REPLY_COOLDOWN_MS
-  ) {
-    return;
-  }
 
   const countries = await getSingletonAutoReplyCountries();
   const cfg = countries[countryKey];
@@ -584,22 +549,6 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     );
 
     if (!claimed) {
-      result.skipped++;
-      continue;
-    }
-
-    // 最終セーフガード: claim 後に再度クールダウンを確認（レース条件対策）
-    const lastAutoAtFinal = claimed.last_auto_reply_at;
-    if (
-      lastAutoAtFinal instanceof Date &&
-      Date.now() - lastAutoAtFinal.getTime() < AUTO_REPLY_COOLDOWN_MS
-    ) {
-      console.log(
-        `[auto-reply] send-skip: cooldown (${(
-          (Date.now() - lastAutoAtFinal.getTime()) /
-          3600_000
-        ).toFixed(1)}h < 11h) conv=${convId}`
-      );
       result.skipped++;
       continue;
     }

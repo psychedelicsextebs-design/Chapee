@@ -35,7 +35,9 @@ import {
   classifyShopeeMessageSender,
   computeBuyerStaffLastMs,
   reviewAutoReplySchedule,
+  scheduleAutoReplyForUnread,
 } from "@/lib/auto-reply";
+import { fetchAllConversationMessages } from "@/lib/shopee-api";
 
 // ---------------------------------------------------------------------------
 // Shared test fixtures
@@ -352,5 +354,258 @@ describe("reviewAutoReplySchedule", () => {
     );
 
     expect(mockCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  // --------------------------------------------------------------------------
+  // NEW Case 5: M_latest 以降にスタッフ手動返信あり → pending クリア
+  //   M1-M4 業務フローの「M1(顧客) → 手動返信 S1」段の基本動作。
+  //   残存 pending 予約があっても、生メッセージ検査で staff 応答を検出し解除する。
+  // --------------------------------------------------------------------------
+  it("Case 5: staff manual reply after M_latest → pending cleared", async () => {
+    const M1 = hoursAgo(20);
+    const S1 = hoursAgo(5); // after M1
+
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv5",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: true, // 残存予約(last_auto_reply_at は未更新のまま)
+        auto_reply_due_at: new Date(M1 + 11 * 3600_000),
+        last_auto_reply_at: null,
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, M1), msg(SHOP_ID, S1)],
+      SHOP_ID,
+      "conv5"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(false);
+    expect(update.$set.auto_reply_due_at).toBeNull();
+  });
+
+  // --------------------------------------------------------------------------
+  // NEW Case 6: M_latest 以降にスタッフ応答なし & triggerHour 経過 → 発火予約
+  //   過去 due は now に丸められる (歴史的仕様、pre-send guard が安全網)。
+  // --------------------------------------------------------------------------
+  it("Case 6: no staff response & triggerHour elapsed → schedules due≈now", async () => {
+    const M1 = hoursAgo(12); // 12h前、triggerHour=11h なので既に過ぎている
+
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv6",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, M1)],
+      SHOP_ID,
+      "conv6"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(true);
+    const due = update.$set.auto_reply_due_at as Date;
+    expect(due).toBeInstanceOf(Date);
+    expect(Math.abs(due.getTime() - Date.now())).toBeLessThan(5_000);
+  });
+
+  // --------------------------------------------------------------------------
+  // NEW Case 7: 自動返信自体がスタッフ応答としてカウントされる → 再発火しない
+  //   「同一顧客メッセージへの連投防止」の本丸。cooldown 撤去後も
+  //   lastStaffMs(auto-reply) >= lastBuyerMs で正しくキャンセルされる。
+  // --------------------------------------------------------------------------
+  it("Case 7: auto-reply counts as staff → no re-fire for same buyer msg", async () => {
+    const M1 = hoursAgo(15);
+    const A1 = hoursAgo(4); // auto-reply 4h ago (旧 cooldown ならブロック範囲)
+
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv7",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: true,
+        auto_reply_due_at: new Date(M1 + 11 * 3600_000),
+        last_auto_reply_at: new Date(A1),
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, M1), msg(SHOP_ID, A1)], // auto-reply は shop_id 送信扱い
+      SHOP_ID,
+      "conv7"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(false);
+    expect(update.$set.auto_reply_due_at).toBeNull();
+  });
+
+  // --------------------------------------------------------------------------
+  // NEW Case 8: M1 → A1 → M2(新規 buyer) → M2 基準で再スケジュール
+  //   旧 cooldown なら A1 から 11h 以内のためブロックされたが、新設計では
+  //   「M2 以降にスタッフ応答なし」で正常に due_at = M2 + triggerHour にセット。
+  // --------------------------------------------------------------------------
+  it("Case 8: new buyer msg after auto-reply → schedules again (no cooldown)", async () => {
+    const M1 = hoursAgo(20);
+    const A1 = hoursAgo(9);     // auto-reply 9h ago
+    const M2 = hoursAgo(8);     // buyer replied 1h after auto-reply
+    // triggerHour=11h → M2 基準の due = M2+11h ≈ +3h future
+
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv8",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: new Date(A1),
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, M1), msg(SHOP_ID, A1), msg(CUSTOMER_ID, M2)],
+      SHOP_ID,
+      "conv8"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(true);
+    const due = update.$set.auto_reply_due_at as Date;
+    const diffH = (due.getTime() - Date.now()) / 3600_000;
+    expect(diffH).toBeGreaterThan(2.5);
+    expect(diffH).toBeLessThan(3.5);
+  });
+});
+
+// ===========================================================================
+// scheduleAutoReplyForUnread — coverage window filter
+//   last_message_time が (triggerHour - 1h) 以内の会話のみ raw fetch → review 委譲
+// ===========================================================================
+describe("scheduleAutoReplyForUnread — coverage window filter", () => {
+  const mockedFetch = vi.mocked(fetchAllConversationMessages);
+
+  beforeEach(() => {
+    mockCollection.findOne.mockReset();
+    mockCollection.updateOne.mockReset();
+    mockCollection.find.mockReset();
+    mockedFetch.mockReset();
+
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return null;
+    });
+  });
+
+  function mockCandidates(docs: Record<string, unknown>[]) {
+    mockCollection.find.mockReturnValue({
+      toArray: vi.fn().mockResolvedValue(docs),
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // カバレッジ窓外(4日前など)の会話は DB フィルタで除外 → raw fetch されない
+  // ------------------------------------------------------------------------
+  it("excludes convs older than (triggerHour - 1h) → no raw fetch", async () => {
+    mockCandidates([]); // DB find が cutoff 適用でヒットなし
+
+    await scheduleAutoReplyForUnread(SHOP_ID, ["c_old"]);
+
+    expect(mockedFetch).not.toHaveBeenCalled();
+    expect(mockCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  // ------------------------------------------------------------------------
+  // 窓内の会話は review に委譲 → buyer 最終のみなら schedule される
+  // ------------------------------------------------------------------------
+  it("includes convs within window → delegates to review & schedules", async () => {
+    const recent = hoursAgo(2); // triggerHour=11h の 10h 窓内
+
+    mockCandidates([
+      {
+        conversation_id: "c_recent",
+        shop_id: SHOP_ID,
+        last_message_time: new Date(recent),
+      },
+    ]);
+
+    // singleton 以外の findOne は conv doc を返す(review 内での lookup)
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "c_recent",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+      };
+    });
+
+    mockedFetch.mockResolvedValue([msg(CUSTOMER_ID, recent)]);
+
+    await scheduleAutoReplyForUnread(SHOP_ID, ["c_recent"]);
+
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(true);
   });
 });
