@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { getCollection } from "@/lib/mongodb";
 import { syncWebhookConversationFull } from "@/lib/shopee-conversation-db-sync";
@@ -35,30 +36,79 @@ import { recordWebhookObservation } from "@/lib/webhook-observation-log";
 export async function POST(request: NextRequest) {
   try {
     const rawBody = await request.text();
+    const authHeader = request.headers.get("authorization");
 
-    // --- 署名検証（SHOPEE_PARTNER_KEY 設定時のみ） ---
+    // --- 署名検証 ---
+    // Shopee Open Platform console の「Verify」テスト push は署名を付けずに送ってくる
+    // 場合があるため、「署名なし/不一致」でも 200 を返して reachability 確認を通す。
+    // 代わりに、実処理は必ず signatureValid === true のブロックでのみ行う。
     const partnerKey = process.env.SHOPEE_PARTNER_KEY?.trim() ?? "";
+    const verifyUrl = resolveShopeeWebhookUrl(request.url);
     let signatureValid = false;
-    if (partnerKey) {
-      const url = resolveShopeeWebhookUrl(request.url);
+    let verifyReason:
+      | "ok"
+      | "no_partner_key"
+      | "no_auth_header"
+      | "signature_mismatch" = "no_partner_key";
+
+    if (partnerKey && authHeader) {
       signatureValid = verifyShopeeWebhookSignature({
-        url,
+        url: verifyUrl,
         rawBody,
-        authorizationHeader: request.headers.get("authorization"),
+        authorizationHeader: authHeader,
         partnerKey,
       });
-      if (!signatureValid) {
-        console.warn(
-          `[Webhook] signature verification FAILED url=${url} bodyLen=${rawBody.length}`
-        );
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-      }
-    } else {
-      console.warn(
-        "[Webhook] SHOPEE_PARTNER_KEY unset — signature verification SKIPPED (dev only)"
-      );
-      signatureValid = false;
+      verifyReason = signatureValid ? "ok" : "signature_mismatch";
+    } else if (partnerKey && !authHeader) {
+      verifyReason = "no_auth_header";
     }
+
+    // 署名が通らない場合は、観察ログだけ残して 200 を返す(絶対に処理しない)
+    if (!signatureValid) {
+      let expectedPrefix = "";
+      if (partnerKey) {
+        try {
+          expectedPrefix = crypto
+            .createHmac("sha256", partnerKey)
+            .update(`${verifyUrl}|${rawBody}`)
+            .digest("hex")
+            .slice(0, 8);
+        } catch {
+          /* ignore — 診断用のプレフィックス計算なので失敗しても続行 */
+        }
+      }
+      const receivedPrefix = authHeader
+        ? authHeader.trim().toLowerCase().slice(0, 8)
+        : "(none)";
+      console.warn(
+        `[Webhook] sig check FAILED reason=${verifyReason} verifyUrl=${verifyUrl} ` +
+          `bodyLen=${rawBody.length} expectedPrefix=${expectedPrefix} ` +
+          `receivedPrefix=${receivedPrefix} bodyHead=${JSON.stringify(
+            rawBody.slice(0, 200)
+          )}`
+      );
+
+      let parsedForObs: Record<string, unknown> = {};
+      try {
+        parsedForObs = rawBody ? JSON.parse(rawBody) : {};
+      } catch {
+        parsedForObs = { _raw_head: rawBody.slice(0, 200) };
+      }
+      const codeForObs =
+        Number((parsedForObs as { code?: unknown }).code ?? 0) || 0;
+      await recordWebhookObservation({
+        code: codeForObs,
+        shop_id: undefined,
+        raw_payload: parsedForObs,
+        signature_valid: false,
+        processed: false,
+        note: `unverified:${verifyReason}`,
+      });
+
+      return NextResponse.json({ message: "OK (unverified)" }, { status: 200 });
+    }
+
+    // --- 以下、signatureValid === true のパスのみ通る ---
 
     let payload: { code?: number; shop_id?: number; data?: Record<string, unknown> };
     try {
