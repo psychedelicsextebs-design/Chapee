@@ -20,18 +20,42 @@ import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
  * user id, persisted on the conversation doc). Any message whose `from_id`
  * does NOT equal `customer_id` is therefore a shop-side (staff) message.
  *
- * Returns "unknown" when `from_id` is 0/missing (system cards etc.) — callers
- * should ignore those entries rather than treating them as either side.
+ * Patch A (to_id fallback):
+ *   Shopee の sticker / 一部のメッセージ種別では `from_id=0` で配信される
+ *   ことがある (4/22 09:10 の sabara2722 / dareraru 誤発火の根本原因)。
+ *   from_id が 0 でも、`to_id === customer_id` なら「buyer 宛」=「staff 送信」と
+ *   断定できる。 buyer 宛だけを確定処理し、それ以外の不明ケースは "unknown" のまま。
+ *
+ * Patch B (unknown default 維持):
+ *   from_id=0 かつ to_id でも向きが特定できない場合は引き続き "unknown" を返す。
+ *   呼び出し側は "unknown" を buyer/staff いずれの最終時刻にも採用しないため、
+ *   Patch C (pre-send cooldown) で「分類不能だが直近活動あり」として安全側に倒す。
  */
 export function classifyShopeeMessageSender(
   msg: Record<string, unknown>,
   customerId: number
 ): "buyer" | "staff" | "unknown" {
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
-  if (!Number.isFinite(fromId) || fromId === 0) return "unknown";
   const buyer = Number(customerId);
-  if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) return "buyer";
-  return "staff";
+
+  if (Number.isFinite(fromId) && fromId > 0) {
+    if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) return "buyer";
+    return "staff";
+  }
+
+  // Patch A: from_id=0 — sticker / system card 等。to_id で向きを推定する。
+  const toId = Number(msg.to_id ?? msg.to_user_id ?? 0);
+  if (
+    Number.isFinite(toId) && toId > 0 &&
+    Number.isFinite(buyer) && buyer > 0 &&
+    toId === buyer
+  ) {
+    // 「buyer 宛」が確定した → 送信者は staff 側 (shop or sub-account)。
+    return "staff";
+  }
+
+  // Patch B: それ以外 (to_id 不明 / 0 / customer_id 不明) は "unknown" のまま。
+  return "unknown";
 }
 
 /**
@@ -57,6 +81,27 @@ export function computeBuyerStaffLastMs(
     }
   }
   return { lastBuyerMs, lastStaffMs };
+}
+
+/**
+ * Pure helper (testable): return the latest message timestamp (ms) regardless
+ * of sender classification.
+ *
+ * Patch C 用: 「from_id=0 / to_id 0 で sender が "unknown" になったメッセージ」
+ * も含めた最終時刻を取得する。 pre-send guard で「最後に分類できた buyer
+ * メッセージより新しい未分類活動があれば送らない」二重防衛に使用する。
+ */
+export function computeLastAnyMessageMs(
+  rawMessages: Record<string, unknown>[]
+): number {
+  let last = 0;
+  for (const msg of rawMessages) {
+    const ts = shopeeMessageTimeToMs(
+      msg.timestamp ?? msg.created_timestamp ?? msg.time
+    );
+    if (ts > last) last = ts;
+  }
+  return last;
 }
 
 /** Mirrors `AutoReplyCountryStored` in settings API */
@@ -526,6 +571,34 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       await clearAutoReplySchedule(convId, shopId);
       console.log(
         `[auto-reply] pre-send guard: cancelled (latest is staff or no buyer msg) conv=${convId} shop=${shopId}`
+      );
+      result.skipped++;
+      continue;
+    }
+
+    /**
+     * Patch C: 送信直前の時刻ベース二重防衛 cooldown
+     *
+     * classifyShopeeMessageSender が「buyer 宛」と特定できなかったメッセージ
+     * (from_id=0 かつ to_id でも判定不能 → "unknown") は computeBuyerStaffLastMs
+     * で完全に無視される。 staff が送った sticker / 特殊メッセージがこれに該当した
+     * 場合、guardStaffMs が 0 のままで上のガードを通過してしまう。
+     *
+     * 二重防衛として「最後に判定できた buyer メッセージより新しい raw メッセージが
+     * 1 件でも存在するなら、未分類でも何らかの直近活動があるとみなして送信を見送る」。
+     * 4/22 09:10 の sabara2722 / dareraru 誤発火パターンに対する最終セーフティネット。
+     *
+     * 副作用: 真の system card (from_id=0 to_id=0) が buyer の後に挟まると
+     * 不必要にスキップする可能性がある。だが「誤送信 > 送信漏れ」の方針に沿う。
+     */
+    const lastAnyMs = computeLastAnyMessageMs(rawList);
+    if (lastAnyMs > guardBuyerMs) {
+      await clearAutoReplySchedule(convId, shopId);
+      console.log(
+        `[auto-reply] pre-send guard (Patch C): cancelled (unclassified activity after lastBuyer) ` +
+          `conv=${convId} shop=${shopId} ` +
+          `lastAny=${new Date(lastAnyMs).toISOString()} ` +
+          `lastBuyer=${new Date(guardBuyerMs).toISOString()}`
       );
       result.skipped++;
       continue;

@@ -34,6 +34,7 @@ vi.mock("@/lib/staff-message-kind", () => ({
 import {
   classifyShopeeMessageSender,
   computeBuyerStaffLastMs,
+  computeLastAnyMessageMs,
   reviewAutoReplySchedule,
   scheduleAutoReplyForUnread,
 } from "@/lib/auto-reply";
@@ -81,11 +82,45 @@ describe("classifyShopeeMessageSender", () => {
     ).toBe("staff");
   });
 
-  it("returns 'unknown' when from_id is 0 / missing (system card)", () => {
+  it("returns 'unknown' when from_id is 0 AND no to_id (system card)", () => {
     expect(classifyShopeeMessageSender({ from_id: 0 }, CUSTOMER_ID)).toBe(
       "unknown"
     );
     expect(classifyShopeeMessageSender({}, CUSTOMER_ID)).toBe("unknown");
+  });
+
+  // Patch A regression: 4/22 09:10 sabara2722 / dareraru 誤発火パターン.
+  // Shopee sticker は from_id=0 で配信されるが to_id は customer_id を持つ。
+  // → 「buyer 宛」と確定できるので staff 送信扱いに分類されるべき。
+  it("returns 'staff' when from_id=0 but to_id === customer_id (Patch A: sticker fallback)", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { from_id: 0, to_id: CUSTOMER_ID },
+        CUSTOMER_ID
+      )
+    ).toBe("staff");
+    // alt key (to_user_id) も拾えること
+    expect(
+      classifyShopeeMessageSender(
+        { from_user_id: 0, to_user_id: CUSTOMER_ID },
+        CUSTOMER_ID
+      )
+    ).toBe("staff");
+  });
+
+  // Patch B: from_id=0 かつ to_id も customer_id でない場合は引き続き "unknown"。
+  // (真の system card や、向きが特定できない異常系を staff/buyer に決めつけない)
+  it("returns 'unknown' when from_id=0 and to_id is also unresolvable (Patch B: default kept)", () => {
+    expect(
+      classifyShopeeMessageSender({ from_id: 0, to_id: 0 }, CUSTOMER_ID)
+    ).toBe("unknown");
+    // to_id があるが customer_id とは違う (向き不明) → staff/buyer 確定せず unknown
+    expect(
+      classifyShopeeMessageSender(
+        { from_id: 0, to_id: 999_999_999 },
+        CUSTOMER_ID
+      )
+    ).toBe("unknown");
   });
 
   it("returns 'staff' when customer_id is 0/invalid but from_id is positive (defensive)", () => {
@@ -135,6 +170,59 @@ describe("computeBuyerStaffLastMs", () => {
     );
     expect(r.lastBuyerMs).toBe(t1 + 1000);
     expect(r.lastStaffMs).toBe(0);
+  });
+
+  // Patch A 効果: from_id=0 + to_id=customer_id の sticker は staff 扱いになる
+  it("counts from_id=0 + to_id=customer_id sticker as staff (Patch A integration)", () => {
+    const tBuyer = 1_700_000_000_000;
+    const tSticker = tBuyer + 60_000; // 1 分後に staff sticker
+    const r = computeBuyerStaffLastMs(
+      [
+        msg(CUSTOMER_ID, tBuyer),
+        { from_id: 0, to_id: CUSTOMER_ID, timestamp: Math.floor(tSticker / 1000) },
+      ],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(tBuyer);
+    expect(r.lastStaffMs).toBe(tSticker);
+  });
+});
+
+// ===========================================================================
+// Patch C: computeLastAnyMessageMs — pre-send 二重防衛 cooldown 用
+// ===========================================================================
+describe("computeLastAnyMessageMs", () => {
+  it("returns 0 for empty list", () => {
+    expect(computeLastAnyMessageMs([])).toBe(0);
+  });
+
+  it("returns max timestamp regardless of from_id classification", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 5_000;
+    const t3 = t2 + 10_000;
+    // 真ん中だけ from_id=0/to_id=0 (true unknown) でも timestamp は拾うのが本ヘルパーの目的
+    const r = computeLastAnyMessageMs([
+      msg(CUSTOMER_ID, t1),
+      { from_id: 0, to_id: 0, timestamp: Math.floor(t2 / 1000) },
+      msg(SHOP_ID, t3),
+    ]);
+    expect(r).toBe(t3);
+  });
+
+  it("captures timestamp of unclassifiable sticker (the bug case)", () => {
+    // buyer message → 後に from_id=0 の sticker (to_id 不明 = unknown 扱い)
+    // computeBuyerStaffLastMs では捉えられない最終活動を Patch C ガードが拾う。
+    const tBuyer = 1_700_000_000_000;
+    const tSticker = tBuyer + 60_000;
+    const list = [
+      msg(CUSTOMER_ID, tBuyer),
+      { from_id: 0, to_id: 0, timestamp: Math.floor(tSticker / 1000) },
+    ];
+    const buyerStaff = computeBuyerStaffLastMs(list, CUSTOMER_ID);
+    const lastAny = computeLastAnyMessageMs(list);
+    expect(buyerStaff.lastStaffMs).toBe(0); // 既存ロジックでは検出不能
+    expect(lastAny).toBe(tSticker);          // Patch C はここで救う
+    expect(lastAny).toBeGreaterThan(buyerStaff.lastBuyerMs);
   });
 });
 
