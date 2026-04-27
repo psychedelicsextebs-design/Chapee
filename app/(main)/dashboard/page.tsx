@@ -22,11 +22,32 @@ import {
   sumNewNotificationIdsFromSyncResults,
 } from "@/lib/chapee-shop-notifications-events";
 import { marketFilterChipsWithAll } from "@/lib/shopee-markets";
+import { safeJsonFetch, formatSafeFetchError } from "@/lib/safe-fetch";
 
 const COUNTRIES = marketFilterChipsWithAll();
 
 /** ダッシュボード表示中の自動同期間隔（ミリ秒） */
 const DASHBOARD_AUTO_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * sync エンドポイントのクライアント側タイムアウト (ms)。
+ * Vercel Pro Function は最大 60 秒で打ち切られるので、それより少し長く取る。
+ * これを超えたら確実に裏側が timeout している → AbortController で fetch を中断、
+ * 「同期中」表示が永遠に消えない事故を根絶する。
+ */
+const SYNC_FETCH_TIMEOUT_MS = 70_000;
+/** /api/chats は軽い参照クエリなのでもっと短く */
+const CHATS_FETCH_TIMEOUT_MS = 20_000;
+/** /api/shopee/connect は OAuth 後処理。長すぎず短すぎず */
+const CONNECT_FETCH_TIMEOUT_MS = 30_000;
+
+type SyncApiResponse = {
+  success?: boolean;
+  message?: string;
+  error?: string;
+  results?: SyncApiResultRow[];
+};
+type ChatsApiResponse = { chats?: Chat[] };
 
 type SyncResultDelta = {
   new_conversation_ids?: string[];
@@ -121,6 +142,31 @@ export default function DashboardPage() {
   const backgroundSyncInFlightRef = useRef(false);
   /** Misconfigured redirect (e.g. Google): user pastes ?code=&shop_id= onto this page */
   const oauthRecoveryRef = useRef(false);
+  /** 同期開始時刻 (UI 表示用、経過秒数の計算と auto-clear 安全網のため) */
+  const [syncStartedAt, setSyncStartedAt] = useState<Date | null>(null);
+
+  // ★ 絶対安全網: どんな経路で flag が立ったままになっても 75 秒で必ずクリア。
+  //   safeJsonFetch のタイムアウトが効けばここまで来ないが、未来のコード変更で
+  //   finally が漏れても「同期中」が永遠に残る事故を起こさないための保険。
+  useEffect(() => {
+    if (!manualSyncing && !backgroundSyncing) {
+      setSyncStartedAt(null);
+      return;
+    }
+    if (!syncStartedAt) setSyncStartedAt(new Date());
+    const id = window.setTimeout(() => {
+      setManualSyncing(false);
+      setBackgroundSyncing(false);
+      backgroundSyncInFlightRef.current = false;
+      setSyncStatus((s) => (s === "syncing" ? "error" : s));
+      setSyncError(
+        (e) =>
+          e ??
+          "同期表示が長時間続いたため UI を解除しました。バックエンドで処理が継続している可能性があります。"
+      );
+    }, 75_000);
+    return () => window.clearTimeout(id);
+  }, [manualSyncing, backgroundSyncing, syncStartedAt]);
 
   // Shopee OAuth: callback redirects to /dashboard?shopee_connected=… or ?shopee_error=…
   useEffect(() => {
@@ -139,9 +185,14 @@ export default function DashboardPage() {
   }, [router]);
 
   const fetchChats = useCallback(async () => {
-    const res = await fetch("/api/chats");
-    if (!res.ok) throw new Error("Failed to load chats");
-    const data = await res.json();
+    // safeJsonFetch: タイムアウト + ok/content-type 検査を一括で適用。
+    // 旧コードは res.json() の前に res.ok チェックがなく「Unexpected token 'A'」
+    // を踏んでいた。
+    const data = await safeJsonFetch<ChatsApiResponse>(
+      "/api/chats",
+      {},
+      { timeoutMs: CHATS_FETCH_TIMEOUT_MS, label: "/api/chats" }
+    );
     return (data.chats || []).map((chat: Chat) => ({
       ...chat,
       type: chat.type || ("buyer" as ChatType),
@@ -156,12 +207,12 @@ export default function DashboardPage() {
     setSyncStatus("syncing");
     setSyncError(null);
     try {
-      const res = await fetch("/api/shopee/sync", { method: "POST" });
-      const data = (await res.json()) as {
-        error?: string;
-        results?: SyncApiResultRow[];
-      };
-      if (!res.ok) throw new Error(data.error || "同期失敗");
+      const data = await safeJsonFetch<SyncApiResponse>(
+        "/api/shopee/sync",
+        { method: "POST" },
+        { timeoutMs: SYNC_FETCH_TIMEOUT_MS, label: "/api/shopee/sync" }
+      );
+      if (data.error) throw new Error(data.error);
       playSoundsForSyncDelta(data.results, playMessageSound, playOrderSound);
       dispatchShopNotificationsRefresh({
         newNotificationIdsTotal: sumNewNotificationIdsFromSyncResults(
@@ -172,10 +223,13 @@ export default function DashboardPage() {
       setLastSynced(new Date());
       setChats(await fetchChats());
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "同期に失敗しました";
+      // 失敗種別に応じた読みやすいメッセージに整形
+      const msg = formatSafeFetchError(err);
       setSyncStatus("error");
       setSyncError(msg);
+      console.warn("[dashboard] background sync failed:", err);
     } finally {
+      // ★ 必ずクリアする (タイムアウト系で「同期中」表示が永遠に残る事故を防ぐ)
       setBackgroundSyncing(false);
       backgroundSyncInFlightRef.current = false;
     }
@@ -195,26 +249,27 @@ export default function DashboardPage() {
 
     (async () => {
       try {
-        const res = await fetch("/api/shopee/connect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            code,
-            shop_id: shopId,
-            country: params.get("country") ?? undefined,
-            region: params.get("region") ?? undefined,
-          }),
-        });
-        const data = (await res.json()) as { error?: string };
-        if (!res.ok) {
-          throw new Error(data.error || "接続に失敗しました");
-        }
+        const data = await safeJsonFetch<{ error?: string }>(
+          "/api/shopee/connect",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              code,
+              shop_id: shopId,
+              country: params.get("country") ?? undefined,
+              region: params.get("region") ?? undefined,
+            }),
+          },
+          { timeoutMs: CONNECT_FETCH_TIMEOUT_MS, label: "/api/shopee/connect" }
+        );
+        if (data.error) throw new Error(data.error);
         toast.success("Shopeeアカウントを接続しました");
         router.replace("/dashboard", { scroll: false });
         await runBackgroundSync();
       } catch (e) {
         oauthRecoveryRef.current = false;
-        toast.error(e instanceof Error ? e.message : "接続に失敗しました");
+        toast.error(formatSafeFetchError(e));
         router.replace("/dashboard", { scroll: false });
       }
     })();
@@ -258,12 +313,12 @@ export default function DashboardPage() {
     setSyncStatus("syncing");
     setSyncError(null);
     try {
-      const res = await fetch("/api/shopee/sync", { method: "POST" });
-      const data = (await res.json()) as {
-        error?: string;
-        results?: SyncApiResultRow[];
-      };
-      if (!res.ok) throw new Error(data.error || "同期に失敗しました");
+      const data = await safeJsonFetch<SyncApiResponse>(
+        "/api/shopee/sync",
+        { method: "POST" },
+        { timeoutMs: SYNC_FETCH_TIMEOUT_MS, label: "/api/shopee/sync" }
+      );
+      if (data.error) throw new Error(data.error);
       playSoundsForSyncDelta(data.results, playMessageSound, playOrderSound);
       dispatchShopNotificationsRefresh({
         newNotificationIdsTotal: sumNewNotificationIdsFromSyncResults(
@@ -275,11 +330,13 @@ export default function DashboardPage() {
       toast.success("Shopeeから会話を同期しました");
       setChats(await fetchChats());
     } catch (error) {
-      const msg = error instanceof Error ? error.message : "同期に失敗しました";
+      const msg = formatSafeFetchError(error);
       setSyncStatus("error");
       setSyncError(msg);
       toast.error(msg);
+      console.warn("[dashboard] manual sync failed:", error);
     } finally {
+      // ★ 必ずクリア (タイムアウト系で「同期中」表示が永遠に残るのを防ぐ)
       setManualSyncing(false);
     }
   };
@@ -343,6 +400,17 @@ export default function DashboardPage() {
     { label: "未読メッセージ", value: totalUnreadMessages, icon: AlertCircle, color: "text-red-600", bg: "bg-red-50 border-red-200" },
   ];
 
+  // 同期中の経過秒数を 1 秒間隔で再計算するためのティック (UI 表示用)。
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!syncStartedAt) return;
+    const id = window.setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [syncStartedAt]);
+  const syncElapsedSec = syncStartedAt
+    ? Math.max(0, Math.floor((Date.now() - syncStartedAt.getTime()) / 1000))
+    : 0;
+
   return (
     <div className="space-y-5 animate-fade-in">
       {/* ページタイトル */}
@@ -351,11 +419,23 @@ export default function DashboardPage() {
           <h1 className="text-2xl font-bold text-gray-900">ダッシュボード</h1>
           <div className="flex items-center gap-2 mt-1">
             {(syncStatus === "syncing" || backgroundSyncing || manualSyncing) && (
-              <span className="flex items-center gap-1 text-xs text-blue-500">
+              <span
+                className={
+                  syncElapsedSec >= 30
+                    ? "flex items-center gap-1 text-xs text-amber-600"
+                    : "flex items-center gap-1 text-xs text-blue-500"
+                }
+              >
                 <Loader2 size={12} className="animate-spin" />
                 {manualSyncing
                   ? "Shopeeから同期中..."
                   : "バックグラウンドでShopee同期中..."}
+                {syncStartedAt && (
+                  <span className="ml-1 tabular-nums">
+                    ({syncElapsedSec}秒
+                    {syncElapsedSec >= 30 && " — 応答待ちが長引いています"})
+                  </span>
+                )}
               </span>
             )}
             {syncStatus === "success" && lastSynced && (
