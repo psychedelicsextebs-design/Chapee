@@ -137,7 +137,12 @@ export async function POST(request: NextRequest) {
     // Handle different webhook events（Push Code は Shopee コンソールの表に従う）
     switch (pushCode) {
       case 10: // webchat_push
-        await handleNewMessage(payload.data ?? {});
+        // shop_id は payload top-level / data 双方をフォールバック対象にする。
+        // 4/27 ログで data.shop_id 欠落 → handleNewMessage 全件スキップ事故が発生したため、
+        // 上位で extract 済みの shopId をフォールバックとして必ず渡す。
+        await handleNewMessage(payload.data ?? {}, {
+          fallbackShopId: Number.isFinite(shopId) && shopId > 0 ? shopId : 0,
+        });
         break;
 
       case 1: // shop_authorization_push
@@ -258,16 +263,85 @@ function strU(v: unknown): string {
  * webchat_push（code 10）: Webhook の data は欠損しがちなため、
  * Shopee API で全メッセージ + get_one_conversation を取り、DB に同期してから自動返信を予約する。
  */
-async function handleNewMessage(data: Record<string, unknown>) {
+async function handleNewMessage(
+  data: Record<string, unknown>,
+  opts?: { fallbackShopId?: number }
+) {
   try {
-    const shopId = numU(data.shop_id ?? data.shopId);
     const conversationId = strU(data.conversation_id).trim();
+
+    // shop_id 解決の優先順位 (多層フォールバック):
+    //   1. data.shop_id / data.shopId  (Shopee 公式 docs の場所)
+    //   2. payload top-level の shop_id  (4/27 観察: 実配信はこちらが多い)
+    //   3. shopee_conversations から conversation_id で逆引き (既存会話なら必ず取れる)
+    //
+    // 4/27 ログで「[Webhook] handleNewMessage: missing shop_id」が 1〜2 分間隔で頻発し
+    // 新着メッセージが DB 同期されず、auto-reply の last_buyer_message_time が
+    // 古いまま → 誤発火の真因になっていた可能性がある。
+    let shopId = numU(data.shop_id ?? data.shopId);
+    let shopIdSource: "data" | "payload_top" | "db_lookup" | "none" =
+      shopId > 0 ? "data" : "none";
+
+    if (!shopId && opts?.fallbackShopId && opts.fallbackShopId > 0) {
+      shopId = opts.fallbackShopId;
+      shopIdSource = "payload_top";
+    }
+
+    if (!shopId && conversationId) {
+      try {
+        const convCol = await getCollection<{ shop_id: number }>(
+          "shopee_conversations"
+        );
+        const row = await convCol.findOne({ conversation_id: conversationId });
+        if (row?.shop_id && Number(row.shop_id) > 0) {
+          shopId = Number(row.shop_id);
+          shopIdSource = "db_lookup";
+        }
+      } catch (lookupErr) {
+        console.warn(
+          "[Webhook] handleNewMessage: db lookup for shop_id failed:",
+          lookupErr
+        );
+      }
+    }
+
     if (!shopId || !conversationId) {
       console.error(
         "[Webhook] handleNewMessage: missing shop_id or conversation_id",
-        data
+        {
+          dataKeys: Object.keys(data),
+          fallbackShopId: opts?.fallbackShopId ?? null,
+          conversationId: conversationId || null,
+          shopId: shopId || null,
+          data,
+        }
       );
+      // Phase 1 観察ログにも残し、Shopee の実配信スキーマを後追いできるようにする
+      await recordWebhookObservation({
+        code: 10,
+        shop_id:
+          opts?.fallbackShopId && opts.fallbackShopId > 0
+            ? opts.fallbackShopId
+            : undefined,
+        raw_payload: {
+          _data: data,
+          _fallback_shop_id: opts?.fallbackShopId ?? null,
+        },
+        signature_valid: true,
+        processed: false,
+        note: !shopId
+          ? "webchat_push_missing_shop_id"
+          : "webchat_push_missing_conv_id",
+      });
       return;
+    }
+
+    if (shopIdSource !== "data") {
+      // 通常パスから外れたときだけログを出す（毎回出すとノイズになる）
+      console.warn(
+        `[Webhook] webchat_push: shop_id resolved via ${shopIdSource} (data に shop_id なし) ` +
+          `conv=${conversationId} shop=${shopId}`
+      );
     }
 
     console.log(`[Webhook] webchat_push conversation=${conversationId} shop=${shopId}`);
