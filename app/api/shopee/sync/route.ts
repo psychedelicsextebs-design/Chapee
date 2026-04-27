@@ -19,10 +19,21 @@ import {
   previewFromConversationListItem,
   shopeeNanoTimestampToDate,
 } from "@/lib/shopee-conversation-utils";
-import {
-  processDueAutoReplies,
-  scheduleAutoReplyForUnread,
-} from "@/lib/auto-reply";
+
+/**
+ * Phase 1 (2026-04-28): processDueAutoReplies と scheduleAutoReplyForUnread を
+ * 本ルートから外した。
+ *
+ * 理由:
+ *   - sync ボタン押下が 3 分超 / 504 timeout を起こし、ダッシュボードが事実上
+ *     使えなくなっていた (Vercel Function timeout)。
+ *   - 両関数はそれぞれ Shopee API への multi-page fetch を「会話 1 件あたり」
+ *     行うため、 sync 1 回のコストを 50-100 倍に膨らませていた。
+ *   - 役割は別経路でカバー済み:
+ *       * 自動返信スケジュール    → webhook (handleNewMessage / 9606c72 で復活)
+ *       * 自動返信送信            → /api/cron/auto-reply (vercel.json: 15分毎 cron)
+ *   - 旧コードのコメント「Hobby は Cron 日次のみ」は stale (現在 Pro)。
+ */
 
 type ShopeeConversation = {
   conversation_id: string;
@@ -189,18 +200,11 @@ export async function GET(request: NextRequest) {
         }
 
         let synced = 0;
-        /**
-         * 自動返信スケジュールの対象候補。
-         *
-         * L1-A（2026-04-19 修正）:
-         *   旧実装は `unread_count > 0` でフィルタしていたため、
-         *   webhook が取りこぼされた状態で会話が既読化されると
-         *   永久にスケジュールされず Shopee 返信期限を超過する穴があった。
-         *   既読フィルタを撤廃し、直近メッセージを持つ会話はすべて候補にする。
-         *   scheduleAutoReplyForUnread 側でスタッフ既返信・クールダウン・
-         *   last_auto_reply_at の重複を弾くため過剰発射にはならない。
-         */
-        const autoReplyCandidateIds: string[] = [];
+        // Phase 1: autoReplyCandidateIds 収集を廃止
+        //   scheduleAutoReplyForUnread を sync ルートから外したため不要。
+        //   webhook (handleNewMessage) が会話毎に reviewAutoReplySchedule を回し、
+        //   さらに /api/cron/auto-reply の processDueAutoReplies が pre-send guard
+        //   で最終チェックする 2 段構えのままで網羅できる。
 
         for (const conv of allConversations) {
           const lastAt = shopeeNanoTimestampToDate(conv.last_message_timestamp);
@@ -248,35 +252,9 @@ export async function GET(request: NextRequest) {
             { upsert: true }
           );
           synced++;
-
-          /**
-           * 自動返信の候補判定は scheduleAutoReplyForUnread 内の条件に委ねる。
-           * ここでは「notification は除外」だけ軽く前処理し、残りは全て渡す。
-           * クールダウン・既返信・last_auto_reply_at は下流で判定される。
-           */
-          if (chatType !== "notification") {
-            autoReplyCandidateIds.push(String(conv.conversation_id));
-          }
         }
 
         console.log(`[Sync] Synced ${synced} conversations to database`);
-
-        /**
-         * Webhook が届かなかった場合のフォールバック:
-         * notification 以外すべての会話を候補として last_message_time ベースで
-         * 自動返信スケジュールを設定する。生メッセージが不要な簡易版
-         * （due_at = last_message_time + triggerHour）。
-         */
-        if (autoReplyCandidateIds.length > 0) {
-          try {
-            await scheduleAutoReplyForUnread(
-              shop.shop_id,
-              autoReplyCandidateIds
-            );
-          } catch (e) {
-            console.warn("[Sync] scheduleAutoReplyForUnread:", e);
-          }
-        }
 
         try {
           await saveSyncSnapshot(
@@ -308,21 +286,10 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    /** Hobby では Vercel Cron が日次のみのため、同期直後に期限到来分を1バッチ処理する */
-    let autoReplyAfterSync: Awaited<
-      ReturnType<typeof processDueAutoReplies>
-    > | null = null;
-    try {
-      autoReplyAfterSync = await processDueAutoReplies();
-      if (
-        autoReplyAfterSync.processed > 0 ||
-        autoReplyAfterSync.sent > 0
-      ) {
-        console.log("[Sync] processDueAutoReplies:", autoReplyAfterSync);
-      }
-    } catch (e) {
-      console.warn("[Sync] processDueAutoReplies:", e);
-    }
+    // Phase 1: processDueAutoReplies はここで呼ばない。
+    // /api/cron/auto-reply (Pro: */15 * * * *) が定期実行する。
+    // sync ルートは「Shopee 一覧 → MongoDB ミラー更新」だけに専念し、
+    // 504 timeout を防ぐ。
 
     console.log("[Sync] Sync complete. Results:", results);
 
@@ -330,9 +297,6 @@ export async function GET(request: NextRequest) {
       success: true,
       message: "Conversations synced",
       results,
-      ...(autoReplyAfterSync
-        ? { auto_reply_after_sync: autoReplyAfterSync }
-        : {}),
     });
   } catch (error) {
     console.error("[Sync] Sync error:", error);
