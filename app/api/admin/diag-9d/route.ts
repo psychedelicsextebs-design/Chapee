@@ -240,7 +240,10 @@ export async function GET(request: NextRequest) {
   // 原因候補を一発で特定できる情報を出す。次回安定後に削除可能。
   const msgCollectionTotal = await msgCol.countDocuments({});
   const msgWithTimestampMs = await msgCol.countDocuments({
-    timestamp_ms: { $exists: true, $type: "number" },
+    timestamp_ms: {
+      $exists: true,
+      $type: ["int", "long", "double", "decimal"],
+    },
   });
   const msgWithSyncedAt = await msgCol.countDocuments({
     synced_at: { $exists: true },
