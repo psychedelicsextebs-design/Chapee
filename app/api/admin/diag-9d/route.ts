@@ -239,11 +239,9 @@ export async function GET(request: NextRequest) {
   // 5/7 報告: 旧版 (timestamp_ms フィルタ) で messages_volume がほぼ空。
   // 原因候補を一発で特定できる情報を出す。次回安定後に削除可能。
   const msgCollectionTotal = await msgCol.countDocuments({});
+  // 型チェックは sample_docs[].timestamp_ms_type に任せ、ここでは存在チェックのみ
   const msgWithTimestampMs = await msgCol.countDocuments({
-    timestamp_ms: {
-      $exists: true,
-      $type: ["int", "long", "double", "decimal"],
-    },
+    timestamp_ms: { $exists: true },
   });
   const msgWithSyncedAt = await msgCol.countDocuments({
     synced_at: { $exists: true },
@@ -302,7 +300,7 @@ export async function GET(request: NextRequest) {
       most_recent_per_shop: messages_most_recent_per_shop,
       _debug: {
         collection_total: msgCollectionTotal,
-        with_timestamp_ms_field_numeric: msgWithTimestampMs,
+        with_timestamp_ms_field: msgWithTimestampMs,
         with_synced_at_field: msgWithSyncedAt,
         count_via_timestamp_ms_filter: msgViaTimestampMsCount,
         sample_docs: msgSampleFields,
