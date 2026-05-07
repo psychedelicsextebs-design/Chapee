@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { getCollection } from "@/lib/mongodb";
+import { enqueuePhase2Trigger } from "@/lib/phase2-triggers";
 import { syncWebhookConversationFull } from "@/lib/shopee-conversation-db-sync";
 import {
   resolveShopeeWebhookUrl,
@@ -215,6 +216,31 @@ async function handleOrderStatusPushObserveOnly(
     processed: false,
     note: "order_status_push",
   });
+
+  // Phase 2 enqueue (PHASE2_TRIGGERS_ENABLED が true のときのみ動作)
+  // - READY_TO_SHIP            -> order_confirmed
+  // - TO_CONFIRM_RECEIVE       -> delivered_plus_3d (実配達タイミング、新鮮)
+  // - COMPLETED                -> delivered_plus_3d (TO_CONFIRM_RECEIVE 取りこぼし保険)
+  // 重複は event_triggered_messages の partial unique + send_log の unique で防止。
+  if (
+    Number.isFinite(shopId) &&
+    shopId > 0 &&
+    ordersn.length > 0
+  ) {
+    if (status === "READY_TO_SHIP") {
+      await enqueuePhase2Trigger({
+        shop_id: shopId,
+        order_sn: ordersn,
+        event_type: "order_confirmed",
+      });
+    } else if (status === "TO_CONFIRM_RECEIVE" || status === "COMPLETED") {
+      await enqueuePhase2Trigger({
+        shop_id: shopId,
+        order_sn: ordersn,
+        event_type: "delivered_plus_3d",
+      });
+    }
+  }
 }
 
 /**
@@ -248,6 +274,21 @@ async function handleOrderTrackingNoPushObserveOnly(
     processed: false,
     note: trackingNo ? "trackingno_push_with_no" : "trackingno_push_missing_no",
   });
+
+  // Phase 2 enqueue: tracking_no が実値で来ている場合のみ tracking_registered。
+  // tracking_no が無い (キャリア未確定) のうちは送らない。
+  if (
+    Number.isFinite(shopId) &&
+    shopId > 0 &&
+    ordersn.length > 0 &&
+    trackingNo.length > 0
+  ) {
+    await enqueuePhase2Trigger({
+      shop_id: shopId,
+      order_sn: ordersn,
+      event_type: "tracking_registered",
+    });
+  }
 }
 
 function numU(v: unknown): number {

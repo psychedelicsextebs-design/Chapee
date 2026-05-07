@@ -43,3 +43,6 @@ coverage
 
 # Auto-reply 被害リスト出力（顧客情報が含まれるためコミットしない）
 scripts/auto-reply-victims.json
+
+# Claude Code local settings (personal, not committed)
+.claude/settings.local.json
