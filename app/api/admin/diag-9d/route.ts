@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCollection } from "@/lib/mongodb";
 import { WEBHOOK_OBSERVATION_LOG_COLLECTION } from "@/lib/webhook-observation-log";
+import { SHOPEE_CHAT_MESSAGES_COLLECTION } from "@/lib/shopee-conversation-db-sync";
 
 /**
  * GET /api/admin/diag-9d?days=9
@@ -59,7 +60,7 @@ export async function GET(request: NextRequest) {
   const since = new Date(sinceMs);
 
   const obsCol = await getCollection<ObsDoc>(WEBHOOK_OBSERVATION_LOG_COLLECTION);
-  const msgCol = await getCollection<MsgDoc>("shopee_chat_messages");
+  const msgCol = await getCollection<MsgDoc>(SHOPEE_CHAT_MESSAGES_COLLECTION);
 
   // ---- webhook_observation_log: 全体集計 ----
   const obsTotal = await obsCol.countDocuments({ received_at: { $gte: since } });
@@ -175,14 +176,20 @@ export async function GET(request: NextRequest) {
     note: "webchat_push_missing_conv_id",
   });
 
-  // ---- shopee_chat_messages: 流量 (sync/webhook ヘルス間接指標) ----
+  // ---- shopee_chat_messages: 流量 (webhook 由来キャッシュの健康度) ----
+  //
+  // 注意: このコレクションは webhook (code 10) が書き込む「フォールバックキャッシュ」。
+  // ダッシュボードの会話一覧は shopee_conversations 由来で別物。
+  // 期間フィルタは synced_at (Date) を使用 — Date 比較なので webhook_observation と
+  // 同じパス。timestamp_ms (number) は最新メッセージ時刻の参照と _debug 用に残す。
+
   const msgTotal = await msgCol.countDocuments({
-    timestamp_ms: { $gte: sinceMs },
+    synced_at: { $gte: since },
   });
 
   const msgByShopAgg = await msgCol
     .aggregate([
-      { $match: { timestamp_ms: { $gte: sinceMs } } },
+      { $match: { synced_at: { $gte: since } } },
       { $group: { _id: "$shop_id", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ])
@@ -193,13 +200,13 @@ export async function GET(request: NextRequest) {
 
   const msgByDayAgg = await msgCol
     .aggregate([
-      { $match: { timestamp_ms: { $gte: sinceMs } } },
+      { $match: { synced_at: { $gte: since } } },
       {
         $group: {
           _id: {
             $dateToString: {
               format: "%Y-%m-%d",
-              date: { $toDate: "$timestamp_ms" },
+              date: "$synced_at",
               timezone: "Asia/Tokyo",
             },
           },
@@ -228,6 +235,40 @@ export async function GET(request: NextRequest) {
       new Date(lastMs).toISOString();
   }
 
+  // ---- _debug: messages_volume が空に見えた件の切り分け用診断 ----
+  // 5/7 報告: 旧版 (timestamp_ms フィルタ) で messages_volume がほぼ空。
+  // 原因候補を一発で特定できる情報を出す。次回安定後に削除可能。
+  const msgCollectionTotal = await msgCol.countDocuments({});
+  const msgWithTimestampMs = await msgCol.countDocuments({
+    timestamp_ms: { $exists: true, $type: "number" },
+  });
+  const msgWithSyncedAt = await msgCol.countDocuments({
+    synced_at: { $exists: true },
+  });
+  const msgViaTimestampMsCount = await msgCol.countDocuments({
+    timestamp_ms: { $gte: sinceMs },
+  });
+  const msgSampleDocs = await msgCol
+    .find({})
+    .sort({ synced_at: -1 })
+    .limit(2)
+    .toArray();
+  const msgSampleFields = msgSampleDocs.map((d) => {
+    const obj = d as unknown as Record<string, unknown>;
+    return {
+      keys: Object.keys(obj),
+      timestamp_ms_type: typeof obj.timestamp_ms,
+      timestamp_ms_value: obj.timestamp_ms ?? null,
+      synced_at_type:
+        obj.synced_at instanceof Date ? "Date" : typeof obj.synced_at,
+      synced_at_value:
+        obj.synced_at instanceof Date
+          ? obj.synced_at.toISOString()
+          : (obj.synced_at ?? null),
+      shop_id: obj.shop_id ?? null,
+    };
+  });
+
   return NextResponse.json({
     generated_at: new Date().toISOString(),
     period_days: days,
@@ -251,10 +292,18 @@ export async function GET(request: NextRequest) {
       },
     },
     messages_volume: {
+      filter_basis: "synced_at",
       total_in_period: msgTotal,
       by_shop: messages_by_shop,
       by_day_jst: messages_by_day_jst,
       most_recent_per_shop: messages_most_recent_per_shop,
+      _debug: {
+        collection_total: msgCollectionTotal,
+        with_timestamp_ms_field_numeric: msgWithTimestampMs,
+        with_synced_at_field: msgWithSyncedAt,
+        count_via_timestamp_ms_filter: msgViaTimestampMsCount,
+        sample_docs: msgSampleFields,
+      },
     },
   });
 }
