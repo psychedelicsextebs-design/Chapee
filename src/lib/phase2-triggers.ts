@@ -6,7 +6,11 @@ import {
   type EventType,
 } from "@/lib/event-triggered-messages";
 import { getCollection } from "@/lib/mongodb";
-import { getOrderDetail, sendMessage } from "@/lib/shopee-api";
+import {
+  getOrderDetail,
+  sendMessage,
+  sendOrderMessage,
+} from "@/lib/shopee-api";
 import { resolveCountryForShop, getValidToken } from "@/lib/shopee-token";
 import {
   getPhase2TriggerSettings,
@@ -300,13 +304,60 @@ export async function processDuePhase2Triggers(
       }
 
       // 6) Shopee に送信 (構造的 dedup の真実の源は send_log の unique index)
-      const sendRes = (await sendMessage(
-        accessToken,
-        doc.shop_id,
-        customerId,
-        content,
-        country ? { country } : undefined
-      )) as Record<string, unknown>;
+      //
+      // 注意: 店舗 → バイヤーへの「先制テキスト送信」は、既存会話がない 2 者間では
+      // Shopee 側で拒否される (エラー: "If 2 users have no existing conversation,
+      // the message must contain order information between 2 users.")。
+      //
+      // この場合 1 回だけ注文カード (message_type: "order") を送って会話を確立してから、
+      // 同じトリガー内でテキストを再送する。 注文カード自体が「自動メッセージ」として
+      // バイヤー側に表示されることでも本トリガーの目的 (注文確認 / 発送通知 / レビュー
+      // 依頼) のフックは果たせるため、片方が失敗しても価値は残る。
+      console.log(
+        `[phase2] sendMessage attempt shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} to_id=${customerId} country=${countryKey} content_len=${content.length}`
+      );
+      let sendRes: Record<string, unknown>;
+      let openedWithOrderCard = false;
+      try {
+        sendRes = (await sendMessage(
+          accessToken,
+          doc.shop_id,
+          customerId,
+          content,
+          country ? { country } : undefined
+        )) as Record<string, unknown>;
+      } catch (sendErr) {
+        const sendMsg =
+          sendErr instanceof Error ? sendErr.message : String(sendErr);
+        const noConversation =
+          sendMsg.includes("must contain order information") ||
+          sendMsg.includes("no existing conversation");
+        if (!noConversation) throw sendErr;
+
+        console.log(
+          `[phase2] no_existing_conversation -> opening with order card shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}`
+        );
+        await sendOrderMessage(
+          accessToken,
+          doc.shop_id,
+          customerId,
+          doc.order_sn,
+          country ? { country } : undefined
+        );
+        openedWithOrderCard = true;
+
+        // 会話確立直後の text 再送
+        sendRes = (await sendMessage(
+          accessToken,
+          doc.shop_id,
+          customerId,
+          content,
+          country ? { country } : undefined
+        )) as Record<string, unknown>;
+        console.log(
+          `[phase2] retry sendMessage after order card succeeded shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}`
+        );
+      }
 
       const sentMessageId = extractSentMessageId(sendRes);
 
@@ -356,7 +407,7 @@ export async function processDuePhase2Triggers(
 
       result.sent++;
       console.log(
-        `[phase2] sent shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} country=${countryKey} template=${countryCfg.template_id}`
+        `[phase2] sent shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} country=${countryKey} template=${countryCfg.template_id} opened_with_order_card=${openedWithOrderCard}`
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

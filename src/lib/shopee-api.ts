@@ -634,6 +634,69 @@ export async function sendMessage(
 }
 
 /**
+ * 注文カード送信（v2.sellerchat.send_message / message_type: order）
+ *
+ * Shopee は店舗 → バイヤーへ「先制」でテキストを送ろうとした場合、 既存会話が
+ * ない 2 者間ではテキストを拒否し、 以下のエラーを返す:
+ *
+ *   "If 2 users have no existing conversation, the message must contain
+ *    order information between 2 users."
+ *
+ * 本関数で先に注文カードメッセージを送ると、その時点で会話が確立されるため、
+ * 続くテキスト送信が通る。
+ *
+ * payload: { to_id, message_type: "order", content: { order_sn } }
+ *  ※ Shopee Open API v2 の order メッセージは content.order_sn のみ必須。
+ *    shop_id は URL の query から取られるので body には入れない。
+ */
+export async function sendOrderMessage(
+  accessToken: string,
+  shopId: number,
+  toId: number,
+  orderSn: string,
+  options?: ShopeeApiOptions
+) {
+  const path = "/api/v2/sellerchat/send_message";
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sign = generateSignature(path, timestamp, accessToken, shopId);
+  const base = getShopeeBaseUrl(options?.country);
+
+  const url =
+    `${base}${path}?` +
+    `partner_id=${PARTNER_ID}&` +
+    `timestamp=${timestamp}&` +
+    `access_token=${encodeURIComponent(accessToken)}&` +
+    `shop_id=${shopId}&` +
+    `sign=${sign}`;
+
+  const body = {
+    to_id: toId,
+    message_type: "order",
+    content: { order_sn: orderSn },
+  };
+
+  console.log(
+    `[shopee-api] sendOrderMessage shop=${shopId} to_id=${toId} order_sn=${orderSn} country=${options?.country ?? "(default)"} body=${JSON.stringify(body)}`
+  );
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const data = await parseShopeeResponseJson(response, "send_order_message");
+
+  if (data.error) {
+    throw new Error(
+      `Shopee API Error (order): ${String(data.message ?? data.error)}`
+    );
+  }
+
+  return data;
+}
+
+/**
  * スタンプ送信（v2.sellerchat.send_message / message_type: sticker）
  */
 export async function sendStickerMessage(

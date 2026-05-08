@@ -237,19 +237,6 @@ function TriggerCard({
 
         {/* 選択中の国のテンプレート設定 */}
         <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 space-y-3">
-          <p className="text-sm text-gray-700">
-            <span className="text-gray-500">※ 選択中: </span>
-            <span className="font-bold text-gray-900">{selectedCountry}</span>
-            <span
-              className={cn(
-                "ml-2 text-xs font-semibold",
-                countryCfg.enabled ? "text-emerald-600" : "text-gray-400"
-              )}
-            >
-              ({countryCfg.enabled ? "ON / 送信対象" : "OFF / 送信されません"})
-            </span>
-          </p>
-
           {templatesForCountry.length === 0 ? (
             <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
               {selectedCountry}{" "}
@@ -260,7 +247,7 @@ function TriggerCard({
             <>
               <div className="flex flex-col sm:flex-row sm:items-center gap-2">
                 <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
-                  使用テンプレート:
+                  使用テンプレート ({selectedCountry}):
                 </span>
                 <select
                   value={countryCfg.template_id}
