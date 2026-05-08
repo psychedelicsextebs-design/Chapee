@@ -2,8 +2,6 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
-  Globe,
-  ChevronRight,
   Info,
   Loader2,
   ShoppingBag,
@@ -12,7 +10,6 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -129,12 +126,33 @@ function TriggerCard({
   );
 
   const setGlobal = (v: boolean) => onChange({ ...cfg, enabled_global: v });
-  const setCountryField = (key: keyof CountryCfg, v: unknown) => {
+
+  /**
+   * 国タブのクリック = 「選択中切替 + enabled の toggle」を同時に行う。
+   * 既存 ON のタブをクリックすると OFF (選択中のまま)、 OFF のタブをクリックすると
+   * ON + 選択中。 enabled の操作経路はこの 1 つだけにして UI を簡素化する。
+   */
+  const handleTabClick = (country: string) => {
+    setSelectedCountry(country);
+    const current = cfg.countries[country] ?? {
+      enabled: false,
+      template_id: "",
+    };
     onChange({
       ...cfg,
       countries: {
         ...cfg.countries,
-        [selectedCountry]: { ...countryCfg, [key]: v },
+        [country]: { ...current, enabled: !current.enabled },
+      },
+    });
+  };
+
+  const setTemplate = (templateId: string) => {
+    onChange({
+      ...cfg,
+      countries: {
+        ...cfg.countries,
+        [selectedCountry]: { ...countryCfg, template_id: templateId },
       },
     });
   };
@@ -168,114 +186,86 @@ function TriggerCard({
 
       <div
         className={cn(
-          "p-5 space-y-5 transition-opacity",
+          "p-5 space-y-4 transition-opacity",
           !cfg.enabled_global && "opacity-50 pointer-events-none"
         )}
       >
+        {/* 国タブ — クリックで ON/OFF + 選択中切替 */}
         <div className="grid grid-cols-7 gap-2">
           {COUNTRIES.map((country) => {
             const c = cfg.countries[country];
+            const isSelected = selectedCountry === country;
+            const isOn = Boolean(c?.enabled);
             return (
               <button
                 key={country}
                 type="button"
-                onClick={() => setSelectedCountry(country)}
+                onClick={() => handleTabClick(country)}
+                title={`クリックで ${isOn ? "OFF" : "ON"} に切り替え`}
                 className={cn(
                   "rounded-xl p-3 border-2 transition-all min-h-[60px] flex flex-col items-center justify-center gap-1",
-                  selectedCountry === country
+                  isOn
                     ? "bg-primary border-primary shadow-md"
-                    : "bg-white border-gray-200 hover:border-primary/50"
+                    : "bg-white border-gray-200 hover:border-primary/50",
+                  isSelected && "ring-2 ring-primary/60 ring-offset-1"
                 )}
               >
                 <p
                   className={cn(
                     "font-bold text-sm",
-                    selectedCountry === country
-                      ? "text-white"
-                      : "text-gray-900"
+                    isOn ? "text-white" : "text-gray-900"
                   )}
                 >
                   {country}
                 </p>
-                <div
+                <span
                   className={cn(
-                    "flex items-center gap-1 text-[10px] font-medium",
-                    selectedCountry === country
-                      ? "text-white/90"
-                      : "text-gray-600"
+                    "text-[10px] font-bold tracking-wide",
+                    isOn ? "text-white/95" : "text-gray-500"
                   )}
                 >
-                  <div
-                    className={cn(
-                      "w-1.5 h-1.5 rounded-full",
-                      c?.enabled
-                        ? selectedCountry === country
-                          ? "bg-white"
-                          : "bg-success"
-                        : "bg-gray-400"
-                    )}
-                  />
-                  <span>{c?.enabled ? "ON" : "OFF"}</span>
-                </div>
+                  {isOn ? "ON" : "OFF"}
+                </span>
               </button>
             );
           })}
         </div>
 
-        <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 bg-primary/10 rounded-lg flex items-center justify-center">
-                <Globe size={14} className="text-primary" />
-              </div>
-              <Label className="text-gray-900 font-semibold text-sm">
-                {selectedCountry} で有効化
-              </Label>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-gray-600 text-xs">
-                {countryCfg.enabled ? "有効" : "無効"}
-              </span>
-              <Switch
-                checked={countryCfg.enabled}
-                onCheckedChange={(v) => setCountryField("enabled", v)}
-              />
-            </div>
-          </div>
+        <p className="text-[11px] text-gray-500 text-center">
+          タブをクリックすると ON / OFF を切り替えます
+        </p>
 
-          <div
-            className={cn(
-              "space-y-3 transition-opacity",
-              !countryCfg.enabled && "opacity-50 pointer-events-none"
-            )}
-          >
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 bg-primary/10 rounded-lg flex items-center justify-center">
-                <ChevronRight size={14} className="text-primary" />
-              </div>
-              <Label className="text-gray-900 font-semibold text-sm">
-                使用テンプレート
-              </Label>
-            </div>
-            <p className="text-gray-600 text-xs">
-              テンプレート管理に登録された「{selectedCountry} 向け」または
-              「全て」のテンプレートから選択できます。
+        {/* 選択中の国のテンプレート設定 */}
+        <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 space-y-3">
+          <p className="text-sm text-gray-700">
+            <span className="text-gray-500">※ 選択中: </span>
+            <span className="font-bold text-gray-900">{selectedCountry}</span>
+            <span
+              className={cn(
+                "ml-2 text-xs font-semibold",
+                countryCfg.enabled ? "text-emerald-600" : "text-gray-400"
+              )}
+            >
+              ({countryCfg.enabled ? "ON / 送信対象" : "OFF / 送信されません"})
+            </span>
+          </p>
+
+          {templatesForCountry.length === 0 ? (
+            <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+              {selectedCountry}{" "}
+              向けのテンプレートがありません。テンプレート画面で
+              {selectedCountry} または「全て」のテンプレートを追加してください。
             </p>
-
-            {templatesForCountry.length === 0 ? (
-              <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
-                {selectedCountry}{" "}
-                向けのテンプレートがありません。テンプレート画面で
-                {selectedCountry} または「全て」のテンプレートを追加してください。
-              </p>
-            ) : (
-              <>
+          ) : (
+            <>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
+                  使用テンプレート:
+                </span>
                 <select
                   value={countryCfg.template_id}
-                  onChange={(e) =>
-                    setCountryField("template_id", e.target.value)
-                  }
-                  className="w-full rounded-xl border-2 border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                  onChange={(e) => setTemplate(e.target.value)}
+                  className="flex-1 rounded-xl border-2 border-gray-200 bg-white px-4 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
                 >
                   <option value="">— 未設定 (送信しない) —</option>
                   {templatesForCountry.map((t) => (
@@ -285,14 +275,14 @@ function TriggerCard({
                     </option>
                   ))}
                 </select>
-                {selectedTemplate && (
-                  <div className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 whitespace-pre-wrap max-h-32 overflow-y-auto">
-                    {selectedTemplate.content}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+              </div>
+              {selectedTemplate && (
+                <div className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 whitespace-pre-wrap max-h-32 overflow-y-auto">
+                  {selectedTemplate.content}
+                </div>
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>
