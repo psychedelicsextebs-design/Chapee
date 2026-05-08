@@ -55,6 +55,71 @@ function generateSignature(
     .digest("hex");
 }
 
+/**
+ * Vercel 関数内 (undici) から `partner.shopeemobile.com` への fetch は、 まれに以下が起きる:
+ *   - Connect Timeout (TCP 接続自体が確立しない / undici default 10s)
+ *   - SocketError "other side closed", bytesRead: 0
+ *     (TCP は通っても TLS / HTTP リクエスト送信前に閉じられる)
+ *
+ * これらは Shopee の API 拒否ではなく **outbound connectivity の一時的揺らぎ** で、
+ * 短い間隔で 1 度だけ再試行すれば吸収できることが多い。 永続的拒否 (4xx/5xx) なら
+ * fetch は Response を返すので、 ここではリトライしない (上位で API error を扱う)。
+ *
+ * 仕様:
+ *   - 明示的 30s timeout (undici default 10s より長め、 region 越え遅延に耐える)
+ *   - throw (fetch failed 系) のみリトライ、 1 回だけ + 500ms backoff
+ *   - cause を console.warn で残す (`code=UND_ERR_*` / `cause=...`)
+ *   - HTTP ステータスでは判断しない (Response が返れば即 return)
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opLabel: string
+): Promise<Response> {
+  const TIMEOUT_MS = 30_000;
+  const MAX_ATTEMPTS = 2;
+  const urlNoQuery = url.split("?")[0];
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      clearTimeout(tid);
+      if (attempt > 1) {
+        console.log(
+          `[shopee-api] ${opLabel} fetch recovered on attempt ${attempt}/${MAX_ATTEMPTS} url=${urlNoQuery}`
+        );
+      }
+      return res;
+    } catch (e) {
+      clearTimeout(tid);
+      lastErr = e;
+      const cause = (e as { cause?: unknown }).cause;
+      const causeMsg =
+        cause instanceof Error
+          ? cause.message
+          : cause && typeof cause === "object"
+            ? JSON.stringify(cause)
+            : String(cause ?? "");
+      const code =
+        cause &&
+        typeof cause === "object" &&
+        "code" in cause &&
+        typeof (cause as { code?: unknown }).code === "string"
+          ? (cause as { code: string }).code
+          : "";
+      console.warn(
+        `[shopee-api] ${opLabel} fetch attempt ${attempt}/${MAX_ATTEMPTS} failed err=${e instanceof Error ? e.message : String(e)} code=${code} cause=${causeMsg} url=${urlNoQuery}`
+      );
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 /** プロキシや Shopee 側で HTML / 空ボディが返る場合があるため、text → JSON.parse で扱う */
 async function parseShopeeResponseJson(
   response: Response,
@@ -128,15 +193,19 @@ export async function refreshAccessToken(
 
   const url = `${base}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sign}`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refresh_token: refreshToken,
-      shop_id: shopId,
-      partner_id: PARTNER_ID,
-    }),
-  });
+  const response = await fetchWithRetry(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        refresh_token: refreshToken,
+        shop_id: shopId,
+        partner_id: PARTNER_ID,
+      }),
+    },
+    `refresh_access_token shop=${shopId}`
+  );
 
   const data = await response.json();
 
@@ -612,15 +681,19 @@ export async function sendMessage(
     `shop_id=${shopId}&` +
     `sign=${sign}`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      to_id: toId,
-      message_type: "text",
-      content: { text: message },
-    }),
-  });
+  const response = await fetchWithRetry(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        to_id: toId,
+        message_type: "text",
+        content: { text: message },
+      }),
+    },
+    `send_message shop=${shopId} to_id=${toId}`
+  );
 
   const data = await parseShopeeResponseJson(response, "send_message");
 
@@ -679,11 +752,15 @@ export async function sendOrderMessage(
     `[shopee-api] sendOrderMessage shop=${shopId} to_id=${toId} order_sn=${orderSn} country=${options?.country ?? "(default)"} body=${JSON.stringify(body)}`
   );
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const response = await fetchWithRetry(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    `send_order_message shop=${shopId} to_id=${toId} order_sn=${orderSn}`
+  );
 
   const data = await parseShopeeResponseJson(response, "send_order_message");
 

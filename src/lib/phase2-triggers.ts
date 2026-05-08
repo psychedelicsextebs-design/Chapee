@@ -162,6 +162,35 @@ export type ProcessResult = {
   errors: { order_sn: string; event_type: EventType; error: string }[];
 };
 
+/**
+ * Node の undici fetch が投げる TypeError("fetch failed") は `cause` に
+ * 真の原因 (ENOTFOUND / ECONNRESET / UND_ERR_SOCKET / TLS など) が入る。
+ * `last_error` に `cause` まで残すために抽出する。
+ */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as Error & { cause?: unknown }).cause;
+    if (cause) {
+      const causeMsg =
+        cause instanceof Error
+          ? cause.message
+          : typeof cause === "object"
+            ? JSON.stringify(cause)
+            : String(cause);
+      const code =
+        cause &&
+        typeof cause === "object" &&
+        "code" in cause &&
+        typeof (cause as { code?: unknown }).code === "string"
+          ? ` code=${(cause as { code: string }).code}`
+          : "";
+      return `${err.message}${code}; cause=${causeMsg}`;
+    }
+    return err.message;
+  }
+  return String(err);
+}
+
 /** queue を cancelled で締めるユーティリティ (内部用)。 */
 async function markCancelled(
   queueCol: Awaited<
@@ -231,8 +260,11 @@ export async function processDuePhase2Triggers(
   result.scanned = due.length;
 
   for (const doc of due) {
+    // どのフェーズで失敗したかを last_error / errors に残すためのトラッカー
+    let phase: string = "init";
     try {
       // 1) 設定ベースのゲート (event_type 全体)
+      phase = "settings_gate";
       const eventCfg = settings.triggers[doc.event_type];
       if (!eventCfg || !eventCfg.enabled_global) {
         await markCancelled(queueCol, doc, "event_type disabled (global)");
@@ -241,7 +273,9 @@ export async function processDuePhase2Triggers(
       }
 
       // 2) token + country 取得
+      phase = "get_token";
       const accessToken = await getValidToken(doc.shop_id);
+      phase = "resolve_country";
       const country = await resolveCountryForShop(doc.shop_id);
       const countryKey =
         typeof country === "string" && country.trim().length > 0
@@ -274,6 +308,7 @@ export async function processDuePhase2Triggers(
       }
 
       // 4) テンプレ本文を解決 (失敗 = テンプレ削除済み等 → cancelled)
+      phase = "resolve_template";
       const content = await resolvePhase2TemplateContent(countryCfg.template_id);
       if (!content) {
         await markCancelled(
@@ -286,6 +321,7 @@ export async function processDuePhase2Triggers(
       }
 
       // 5) customer_id 解決
+      phase = "resolve_customer";
       const customerId = await resolveCustomerId(doc, accessToken, country);
       if (!customerId) {
         result.skipped_missing_customer++;
@@ -318,6 +354,7 @@ export async function processDuePhase2Triggers(
       );
       let sendRes: Record<string, unknown>;
       let openedWithOrderCard = false;
+      phase = "send_text";
       try {
         sendRes = (await sendMessage(
           accessToken,
@@ -337,6 +374,7 @@ export async function processDuePhase2Triggers(
         console.log(
           `[phase2] no_existing_conversation -> opening with order card shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}`
         );
+        phase = "send_order_card";
         await sendOrderMessage(
           accessToken,
           doc.shop_id,
@@ -347,6 +385,7 @@ export async function processDuePhase2Triggers(
         openedWithOrderCard = true;
 
         // 会話確立直後の text 再送
+        phase = "send_text_retry";
         sendRes = (await sendMessage(
           accessToken,
           doc.shop_id,
@@ -362,6 +401,7 @@ export async function processDuePhase2Triggers(
       const sentMessageId = extractSentMessageId(sendRes);
 
       // 7) 送信ジャーナルに insert (unique index で 1 度だけ)
+      phase = "write_send_log";
       try {
         await logCol.insertOne({
           shop_id: doc.shop_id,
@@ -410,12 +450,13 @@ export async function processDuePhase2Triggers(
         `[phase2] sent shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} country=${countryKey} template=${countryCfg.template_id} opened_with_order_card=${openedWithOrderCard}`
       );
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const detail = describeError(e);
+      const stamped = `[${phase}] ${detail}`;
       result.failed++;
       result.errors.push({
         order_sn: doc.order_sn,
         event_type: doc.event_type,
-        error: msg,
+        error: stamped,
       });
       try {
         await queueCol.updateOne(
@@ -423,7 +464,7 @@ export async function processDuePhase2Triggers(
           {
             $set: {
               status: "failed",
-              last_error: msg.slice(0, 500),
+              last_error: stamped.slice(0, 500),
               updated_at: new Date(),
             },
             $inc: { retry_count: 1 },
@@ -433,7 +474,7 @@ export async function processDuePhase2Triggers(
         /* ignore */
       }
       console.error(
-        `[phase2] send failed shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}:`,
+        `[phase2] send failed phase=${phase} shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}: ${detail}`,
         e
       );
     }
