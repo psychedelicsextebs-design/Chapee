@@ -8,9 +8,14 @@ import {
 import { getCollection } from "@/lib/mongodb";
 import { getOrderDetail, sendMessage } from "@/lib/shopee-api";
 import { resolveCountryForShop, getValidToken } from "@/lib/shopee-token";
+import {
+  getPhase2TriggerSettings,
+  resolvePhase2TemplateContent,
+  type Phase2TriggerSettings,
+} from "@/lib/phase2-trigger-settings";
 
 /**
- * Phase 2: イベント駆動メッセージのテンプレート / enqueue / send を一括で持つ。
+ * Phase 2: イベント駆動メッセージの enqueue / send を一括で持つ。
  *
  * 既存の auto-reply (営業時間外・12時間ペナルティ回避) とは:
  *   - 別コレクション (event_triggered_messages / event_triggered_send_log)
@@ -18,6 +23,11 @@ import { resolveCountryForShop, getValidToken } from "@/lib/shopee-token";
  *   - 別 cron (/api/cron/event-triggered)
  * で完全分離。 staff_message_kind_log にも書かない (既存の誤発火検出ロジックが
  * 反応してしまうため)。
+ *
+ * テンプレート解決: `phase2_trigger_settings` (singleton) と `reply_templates` を
+ * 引いて、 (event_type, country) で動的に決まる。 設定がない / 該当国 disabled /
+ * テンプレ未指定 / 本文取得失敗 のいずれも「送らない (cancelled)」で締める。
+ * (誤送信 > 送信漏れ の方針)
  *
  * 安全装置:
  *   - 環境変数 PHASE2_TRIGGERS_ENABLED が "true" でない限り enqueue / send は
@@ -28,27 +38,6 @@ import { resolveCountryForShop, getValidToken } from "@/lib/shopee-token";
 
 export function isPhase2Enabled(): boolean {
   return String(process.env.PHASE2_TRIGGERS_ENABLED ?? "").toLowerCase() === "true";
-}
-
-/** ハードコード英語テンプレート (将来の多言語化は同 file 内の Record 拡張で対応可) */
-const TEMPLATES: Record<EventType, string> = {
-  order_confirmed:
-    "Thank you for your order! We're preparing your items for shipment. " +
-    "You'll receive a tracking number once the parcel leaves our warehouse.",
-
-  tracking_registered:
-    "Your order has been shipped! You can track its journey using the " +
-    "tracking number provided in your Shopee app. Thank you for shopping with us!",
-
-  delivered_plus_3d:
-    "We hope you're enjoying your purchase! If you're satisfied, we'd " +
-    "really appreciate a review on Shopee. If anything's wrong, please reply " +
-    "here and we'll make it right.",
-};
-
-/** template_id field に入れる sentinel (DB テンプレート参照ではないことを示す) */
-function templateSentinelId(et: EventType): string {
-  return `code:${et}:default`;
 }
 
 export type EnqueueArgs = {
@@ -72,6 +61,9 @@ export type EnqueueArgs = {
  *
  * - PHASE2_TRIGGERS_ENABLED が false の間は何もしない。
  * - 例外は呼び出し側に伝搬させない (webhook 受信を絶対に止めない)。
+ *
+ * 注: enqueue 時点では template_id を空にしておく。 送信時に settings から
+ * (event_type, country) で動的解決するため。
  */
 export async function enqueuePhase2Trigger(args: EnqueueArgs): Promise<void> {
   if (!isPhase2Enabled()) return;
@@ -88,7 +80,7 @@ export async function enqueuePhase2Trigger(args: EnqueueArgs): Promise<void> {
       event_type: args.event_type,
       customer_id: args.customer_id ?? 0,
       conversation_id: args.conversation_id,
-      template_id: templateSentinelId(args.event_type),
+      template_id: "",
       due_at: args.due_at ?? now,
       status: "pending",
       retry_count: 0,
@@ -160,13 +152,37 @@ export type ProcessResult = {
   sent: number;
   skipped_duplicate: number;
   skipped_missing_customer: number;
+  skipped_disabled: number;
+  skipped_no_template: number;
   failed: number;
   errors: { order_sn: string; event_type: EventType; error: string }[];
 };
 
+/** queue を cancelled で締めるユーティリティ (内部用)。 */
+async function markCancelled(
+  queueCol: Awaited<
+    ReturnType<typeof getCollection<EventTriggeredMessageDoc>>
+  >,
+  doc: EventTriggeredMessageDoc,
+  reason: string
+): Promise<void> {
+  await queueCol.updateOne(
+    { _id: doc._id },
+    {
+      $set: {
+        status: "cancelled",
+        last_error: reason,
+        updated_at: new Date(),
+      },
+    }
+  );
+}
+
 /**
  * pending queue を drain して送信する。 cron が呼ぶ。
  * - PHASE2_TRIGGERS_ENABLED が false の間は noop で 0 件返す。
+ * - settings (singleton) が未投入 / 該当 event_type が disabled / 該当 country が
+ *   disabled / template_id 未設定 / 本文未取得 のいずれも cancelled。
  * - 1 回の起動で最大 maxBatch 件まで処理 (cron 実行時間内に収める)。
  * - 失敗は status="failed" + retry_count++ で残し、 次回 cron で再試行可能。
  */
@@ -178,11 +194,19 @@ export async function processDuePhase2Triggers(
     sent: 0,
     skipped_duplicate: 0,
     skipped_missing_customer: 0,
+    skipped_disabled: 0,
+    skipped_no_template: 0,
     failed: 0,
     errors: [],
   };
 
   if (!isPhase2Enabled()) return result;
+
+  const settings: Phase2TriggerSettings | null = await getPhase2TriggerSettings();
+  // settings 未投入 (UI からまだ一度も保存されていない) → 何もしない。
+  // pending を cancelled で潰さない方針 (UI 側で保存後に同 cron で送信再開できるよう
+  // pending のまま残す)。
+  if (!settings) return result;
 
   const maxBatch = Math.max(1, Math.min(200, opts?.maxBatch ?? 50));
   const now = new Date();
@@ -204,11 +228,60 @@ export async function processDuePhase2Triggers(
 
   for (const doc of due) {
     try {
-      // 1) token + country 取得
+      // 1) 設定ベースのゲート (event_type 全体)
+      const eventCfg = settings.triggers[doc.event_type];
+      if (!eventCfg || !eventCfg.enabled_global) {
+        await markCancelled(queueCol, doc, "event_type disabled (global)");
+        result.skipped_disabled++;
+        continue;
+      }
+
+      // 2) token + country 取得
       const accessToken = await getValidToken(doc.shop_id);
       const country = await resolveCountryForShop(doc.shop_id);
+      const countryKey =
+        typeof country === "string" && country.trim().length > 0
+          ? country.trim().toUpperCase()
+          : "";
 
-      // 2) customer_id 解決
+      // 3) 国別ゲート + テンプレ ID
+      const countryCfg = countryKey
+        ? eventCfg.countries[countryKey]
+        : undefined;
+      if (!countryCfg || !countryCfg.enabled) {
+        await markCancelled(
+          queueCol,
+          doc,
+          countryKey
+            ? `country disabled (${countryKey})`
+            : "country unresolved"
+        );
+        result.skipped_disabled++;
+        continue;
+      }
+      if (!countryCfg.template_id) {
+        await markCancelled(
+          queueCol,
+          doc,
+          `template not set (${countryKey})`
+        );
+        result.skipped_no_template++;
+        continue;
+      }
+
+      // 4) テンプレ本文を解決 (失敗 = テンプレ削除済み等 → cancelled)
+      const content = await resolvePhase2TemplateContent(countryCfg.template_id);
+      if (!content) {
+        await markCancelled(
+          queueCol,
+          doc,
+          `template content unresolved (${countryCfg.template_id})`
+        );
+        result.skipped_no_template++;
+        continue;
+      }
+
+      // 5) customer_id 解決
       const customerId = await resolveCustomerId(doc, accessToken, country);
       if (!customerId) {
         result.skipped_missing_customer++;
@@ -226,9 +299,7 @@ export async function processDuePhase2Triggers(
         continue;
       }
 
-      // 3) Shopee に送信 (構造的 dedup の真実の源は send_log の unique index)
-      const content = TEMPLATES[doc.event_type];
-
+      // 6) Shopee に送信 (構造的 dedup の真実の源は send_log の unique index)
       const sendRes = (await sendMessage(
         accessToken,
         doc.shop_id,
@@ -239,7 +310,7 @@ export async function processDuePhase2Triggers(
 
       const sentMessageId = extractSentMessageId(sendRes);
 
-      // 4) 送信ジャーナルに insert (unique index で 1 度だけ)
+      // 7) 送信ジャーナルに insert (unique index で 1 度だけ)
       try {
         await logCol.insertOne({
           shop_id: doc.shop_id,
@@ -268,7 +339,7 @@ export async function processDuePhase2Triggers(
         throw e;
       }
 
-      // 5) queue を sent に
+      // 8) queue を sent に + 解決した template_id を記録 (デバッグ用)
       await queueCol.updateOne(
         { _id: doc._id },
         {
@@ -276,6 +347,7 @@ export async function processDuePhase2Triggers(
             status: "sent",
             sent_at: new Date(),
             sent_message_id: sentMessageId ?? null,
+            template_id: countryCfg.template_id,
             last_error: null,
             updated_at: new Date(),
           },
@@ -284,7 +356,7 @@ export async function processDuePhase2Triggers(
 
       result.sent++;
       console.log(
-        `[phase2] sent shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type}`
+        `[phase2] sent shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} country=${countryKey} template=${countryCfg.template_id}`
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

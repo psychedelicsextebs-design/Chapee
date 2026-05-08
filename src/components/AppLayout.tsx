@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   FileText,
   Zap,
+  Bell,
   Users,
   LogOut,
   Menu,
@@ -37,6 +38,7 @@ const navItems = [
   { icon: ListTodo, label: "タスク管理", path: "/tasks" },
   { icon: FileText, label: "テンプレート", path: "/templates" },
   { icon: Zap, label: "自動返信設定", path: "/auto-reply" },
+  { icon: Bell, label: "イベント通知", path: "/event-triggered" },
   { icon: Users, label: "担当者管理", path: "/staff" },
   { icon: Settings, label: "設定", path: "/settings" },
 ];
