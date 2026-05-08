@@ -55,6 +55,11 @@ export type EnqueueArgs = {
   customer_id?: number;
   /** 任意。 送信時の get_one_conversation 用ヒント。 */
   conversation_id?: string;
+  /**
+   * 任意。 webhook code 4 で配信される追跡番号。 本文の `[TRACKING_NUMBER]`
+   * プレースホルダ置換に使う。 tracking_registered 以外では渡さない想定。
+   */
+  tracking_no?: string;
   /** 任意。 デフォルトは即時 (now)。 */
   due_at?: Date;
 };
@@ -78,6 +83,10 @@ export async function enqueuePhase2Trigger(args: EnqueueArgs): Promise<void> {
     );
 
     const now = new Date();
+    const trackingNo =
+      typeof args.tracking_no === "string" && args.tracking_no.length > 0
+        ? args.tracking_no
+        : undefined;
     const doc: Omit<EventTriggeredMessageDoc, "_id"> = {
       shop_id: args.shop_id,
       order_sn: args.order_sn,
@@ -85,6 +94,7 @@ export async function enqueuePhase2Trigger(args: EnqueueArgs): Promise<void> {
       customer_id: args.customer_id ?? 0,
       conversation_id: args.conversation_id,
       template_id: "",
+      tracking_no: trackingNo,
       due_at: args.due_at ?? now,
       status: "pending",
       retry_count: 0,
@@ -189,6 +199,33 @@ function describeError(err: unknown): string {
     return err.message;
   }
   return String(err);
+}
+
+/**
+ * テンプレ本文中のプレースホルダを実値で置換する。
+ *
+ * サポート:
+ *   - `[TRACKING_NUMBER]` → tracking_no (code 4 webhook で取れる)
+ *   - `[ORDER_SN]`        → order_sn (常に解決可能)
+ *
+ * 戻り値の `unresolved` には、置換後も残っている `[A-Z_]+` 形式の文字列を
+ * 重複排除して列挙する。 上位ロジックはこれが空でない場合 cancelled で締める
+ * 想定 (誤情報入りメッセージを送らない方針)。
+ */
+function applyPlaceholders(
+  template: string,
+  vars: { tracking_no?: string; order_sn?: string }
+): { resolved: string; unresolved: string[] } {
+  let s = template;
+  if (vars.tracking_no && vars.tracking_no.length > 0) {
+    s = s.split("[TRACKING_NUMBER]").join(vars.tracking_no);
+  }
+  if (vars.order_sn && vars.order_sn.length > 0) {
+    s = s.split("[ORDER_SN]").join(vars.order_sn);
+  }
+  const matches = s.match(/\[[A-Z_]+\]/g);
+  const unresolved = matches ? Array.from(new Set(matches)) : [];
+  return { resolved: s, unresolved };
 }
 
 /** queue を cancelled で締めるユーティリティ (内部用)。 */
@@ -309,14 +346,38 @@ export async function processDuePhase2Triggers(
 
       // 4) テンプレ本文を解決 (失敗 = テンプレ削除済み等 → cancelled)
       phase = "resolve_template";
-      const content = await resolvePhase2TemplateContent(countryCfg.template_id);
-      if (!content) {
+      const rawContent = await resolvePhase2TemplateContent(
+        countryCfg.template_id
+      );
+      if (!rawContent) {
         await markCancelled(
           queueCol,
           doc,
           `template content unresolved (${countryCfg.template_id})`
         );
         result.skipped_no_template++;
+        continue;
+      }
+
+      // 4.5) プレースホルダ置換 ([TRACKING_NUMBER] / [ORDER_SN])
+      // 未解決のプレースホルダが残ったまま送ると、 バイヤーに変な文字列が届くので
+      // cancelled で締める (cron 自動 retry もしない / 人間がテンプレを直すか
+      // tracking_no を再取得する必要がある)。
+      phase = "apply_placeholders";
+      const { resolved: content, unresolved } = applyPlaceholders(rawContent, {
+        tracking_no: doc.tracking_no,
+        order_sn: doc.order_sn,
+      });
+      if (unresolved.length > 0) {
+        await markCancelled(
+          queueCol,
+          doc,
+          `unresolved placeholder(s): ${unresolved.join(",")}`
+        );
+        result.skipped_no_template++;
+        console.warn(
+          `[phase2] cancelled (unresolved placeholders) shop=${doc.shop_id} order=${doc.order_sn} event=${doc.event_type} placeholders=${unresolved.join(",")} tracking_no=${doc.tracking_no ?? "(missing)"}`
+        );
         continue;
       }
 

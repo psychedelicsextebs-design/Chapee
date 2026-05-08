@@ -277,6 +277,7 @@ async function handleOrderTrackingNoPushObserveOnly(
 
   // Phase 2 enqueue: tracking_no が実値で来ている場合のみ tracking_registered。
   // tracking_no が無い (キャリア未確定) のうちは送らない。
+  // tracking_no は doc に保存して send 時に [TRACKING_NUMBER] プレースホルダ置換に使う。
   if (
     Number.isFinite(shopId) &&
     shopId > 0 &&
@@ -287,6 +288,7 @@ async function handleOrderTrackingNoPushObserveOnly(
       shop_id: shopId,
       order_sn: ordersn,
       event_type: "tracking_registered",
+      tracking_no: trackingNo,
     });
   }
 }

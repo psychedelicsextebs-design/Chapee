@@ -1,7 +1,16 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Plus, Edit2, Trash2, FileText, Check, Star, Loader2 } from "lucide-react";
+import {
+  Plus,
+  Edit2,
+  Trash2,
+  FileText,
+  Check,
+  Star,
+  Loader2,
+  Languages,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
@@ -63,6 +72,7 @@ export default function TemplatesPage() {
   const [newContent, setNewContent] = useState("");
   const [newAutoReply, setNewAutoReply] = useState(false);
   const [newLangs, setNewLangs] = useState<string[]>(["JA"]);
+  const [translating, setTranslating] = useState(false);
 
   const resetCreateForm = useCallback(() => {
     setNewCountry("全て");
@@ -77,6 +87,42 @@ export default function TemplatesPage() {
     setNewLangs((prev) =>
       prev.includes(lang) ? prev.filter((l) => l !== lang) : [...prev, lang]
     );
+  };
+
+  /**
+   * 「日 → 英 翻訳」ボタン: 既存 /api/translate (DeepL / Google) を呼び、
+   * 本文を上書き + 対応言語フラグに EN を追加する。 settings の翻訳ツール設定で
+   * 選んだエンジンが使われる (キー未設定なら 503 が返り toast でエラー表示)。
+   */
+  const translateNewContentToEN = async () => {
+    const src = newContent.trim();
+    if (!src) {
+      toast.error("本文を先に入力してください");
+      return;
+    }
+    setTranslating(true);
+    try {
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: src, target_lang: "EN" }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        text?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.text) {
+        toast.error(data.error ?? "翻訳に失敗しました");
+        return;
+      }
+      setNewContent(data.text);
+      setNewLangs((prev) => (prev.includes("EN") ? prev : [...prev, "EN"]));
+      toast.success("英訳しました");
+    } catch {
+      toast.error("翻訳に失敗しました");
+    } finally {
+      setTranslating(false);
+    }
   };
 
   const createTemplate = async () => {
@@ -255,7 +301,24 @@ export default function TemplatesPage() {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="tpl-content">本文</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="tpl-content">本文</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={translateNewContentToEN}
+                  disabled={translating || !newContent.trim()}
+                  className="h-7 text-xs px-2 gap-1"
+                >
+                  {translating ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <Languages size={12} />
+                  )}
+                  日 → 英 翻訳
+                </Button>
+              </div>
               <Textarea
                 id="tpl-content"
                 value={newContent}
@@ -263,6 +326,12 @@ export default function TemplatesPage() {
                 placeholder="お客様への返信メッセージを入力"
                 className="min-h-[120px] resize-none"
               />
+              <p className="text-[11px] text-muted-foreground">
+                プレースホルダ:
+                <code className="mx-1 px-1 rounded bg-muted">[TRACKING_NUMBER]</code>
+                <code className="mx-1 px-1 rounded bg-muted">[ORDER_SN]</code>
+                は送信時に実値で置換されます。
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label>対応言語</Label>

@@ -57,6 +57,14 @@ export type EventTriggeredMessageDoc = {
   /** 送信対象テンプレート（reply_templates._id） */
   template_id: string;
 
+  /**
+   * 任意。 webhook code 4 (order_trackingno_push) 受信時に同梱されてきた追跡番号。
+   * 本文中の `[TRACKING_NUMBER]` プレースホルダ置換に使用する。
+   * order_confirmed / delivered_plus_3d ではセットされない (webhook payload に
+   * 入っていないため)。
+   */
+  tracking_no?: string;
+
   /** 送信予定時刻（UTC） */
   due_at: Date;
 
