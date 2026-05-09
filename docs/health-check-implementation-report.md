@@ -1,10 +1,16 @@
 # Auto-reply ヘルスチェック 実装レポート
 
 ブランチ: `feature/health-check` (派生元: `main`)
-作業日: 2026-05-09 (夜間バッチ第 2 タスク)
+作業日: 2026-05-09 (夜間バッチ第 2 タスク + 追加修正)
 作業者: Claude
-コミット数: 3 + 本レポート (= 4)
+コミット数: 4 + 追加修正 1 + 本レポート更新 (= 6)
 **push 状態: ローカル保留 (オーナー承認待ち)**
+
+> **更新 (2026-05-09 追記)**: オーナーフィードバックに基づき 2 点の追加修正を入れ、
+> 末尾に「追加修正 (2026-05-09 第 2 ラウンド)」セクションを追加した。
+> 設計書 § 検知対象の `status !== "resolved"` は当初 `handling_status !== "completed"`
+> 単独で実装していたが、Atlas で sunrainsky レコードに `status:"resolved"` が
+> 残っていることが確認されたため、両方を AND で除外する形に修正済み。
 
 ---
 
@@ -187,3 +193,105 @@ push 後の動作確認:
 - DB / Atlas / Shopee API / 環境変数 / Vercel: 触っていない
 - 既存 cron route (`auto-reply` / `event-triggered`): 触っていない
 - 新規パッケージ: 追加していない
+
+---
+
+## 【追加修正 (2026-05-09 第 2 ラウンド)】
+
+オーナーが Atlas で sunrainsky レコードを確認した結果、(a) `status: "resolved"` という
+**legacy フィールド** が残っていたこと、(b) 過去データに country の小文字混在の
+可能性があることが判明。 2 点を追加 commit で対応した。
+
+### 追加コミット
+
+```
+ac6e756 fix(health-check): exclude legacy status='resolved' and match country case-insensitive
+```
+
+差分: `src/lib/health-check.ts` (+15/-3) / `src/test/health-check.test.ts` (+129/-6)。
+
+### 修正 1: legacy `status='resolved'` を除外
+
+`findMissedConversations()` の Mongo filter から `handling_status: { $ne: "completed" }` を
+外し、`$and: [...]` で **両条件** を要求するよう変更:
+
+```ts
+$and: [
+  { handling_status: { $ne: "completed" } },
+  { status: { $ne: "resolved" } },
+],
+```
+
+これにより、過去データ経路で残っていた `status:"resolved"` の会話も検知対象外に落ちる。
+新規データ (`handling_status` ベース) との両立。
+
+JSDoc / コメントも追従更新済み。 設計書 § 検知対象 `status !== "resolved"` は **正しく
+読まれ、実 schema ではどちらか片方しか持たない (旧/新) ためのデュアル化** と位置付ける。
+
+### 修正 2: country case-insensitive
+
+`country: { $in: [...] }` の値リストに **uppercase と lowercase の両ケース** を並べた:
+
+```ts
+const countryVariants = eligibleKeys.flatMap((c) => [c, c.toLowerCase()]);
+country: { $in: countryVariants },
+```
+
+例: `eligibleKeys = ["SG", "MY"]` → `$in = ["SG", "sg", "MY", "my"]`。
+
+アプリ層側は doc.country を `String(country).toUpperCase()` して `eligibleCountries` を
+引いているため、小文字保存の doc も最終的に正しい triggerHour に解決される。
+
+### 追加テスト (6 件、全 pass)
+
+**修正 1 系**:
+- ✅ Mongo filter に `{ status: { $ne: "resolved" } }` が含まれる
+- ✅ Mongo filter に `{ handling_status: { $ne: "completed" } }` が `$and` 内にある
+- ✅ 両フィールド未設定の doc は missed_count=1 で拾う (回帰防止)
+
+**修正 2 系**:
+- ✅ Mongo filter の `country: $in` に SG / sg / MY / my 全 4 件が含まれる、PH/ph は含まれない
+- ✅ `country: "sg"` (小文字) の doc を拾う + レスポンスは `country: "SG"` に正規化
+- ✅ `country: "SG"` (大文字) の doc を従来通り拾う
+
+既存 12 件のうち 1 件 (Case 4 の `country.$in` を `["SG"]` で固定 assert していたもの) は
+新仕様に追従して `["SG", "sg"]` (length=2) を期待する形に更新。
+
+### テスト結果 (追加修正後)
+
+```
+src/test/health-check.test.ts — 18 / 18 passed (12 既存 + 6 追加)
+全体: Test Files 4 passed, Tests 60 passed (54 → 60)
+npx tsc --noEmit — エラーなし
+```
+
+### push 推奨度: 引き続き 高
+
+- 追加修正は **既存 health-check ロジック内の filter 強化のみ** で、外部依存・副作用は
+  従来と同じ (read-only / no Shopee API)。
+- 既存挙動への影響: ない (status / 小文字 country で過去データに該当するものが
+  あれば、今までは取りこぼしていた → 今後は拾うようになる方向だけ)。
+- 失敗時の保守性: filter が AND 拡張なので「拾えていたものを取りこぼす」リスクは
+  発生しない (過剰除外側のリスクは『status="resolved"』 / 『handling_status="completed"』の
+  どちらか一方だけ正しく振られている doc を除外する点だが、それは元々の設計意図)。
+
+### push 後の動作確認 (推奨)
+
+- Vercel Logs で初回スキャン時に `[cron/health-check]` 行が出ていること。
+- もし `missed_count > 0` が出たら、その会話の `country` と `handling_status` / `status`
+  を Atlas で目視確認し、本修正の対象データだったかを照合 (sunrainsky 系の取りこぼしが
+  実際に解消されているかの確認)。
+
+---
+
+## 【最終コミット一覧 (追加修正後)】
+
+```
+ac6e756 fix(health-check): exclude legacy status='resolved' and match country case-insensitive
+ae7559d docs(health-check): implementation report
+bb45db7 test(health-check): cover empty/missed/auth/no-trigger-config cases
+1720090 chore(cron): schedule health-check every 15 min
+2da7e6c feat(health-check): add auto-reply miss detector (read-only Mongo scan)
+```
+
+(本レポート更新 commit がさらに 1 件 続く予定)
