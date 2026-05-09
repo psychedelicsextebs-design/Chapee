@@ -30,6 +30,10 @@
  *                      (Shopee 公式 sticker の意図に合わせ整理)
  *              image_url: public/stickers/ に同梱した PNG をルート相対パスで参照。
  *                         Shopee CDN を直接叩く案は DB 抽出 0 件で見送り。
+ *  2026-05-09: ラベル対応修正 (オーナー目視確認でズレ判明)。
+ *              02:こんにちは / 03:ありがとう / 06:ごめんなさい / 29:了解
+ *              画像ファイル (public/stickers/orangutan_my_new_NN.png) は元から
+ *              正しい意図で配置済みで、ラベル側の組み合わせだけがズレていた。
  * ------------------------------------------------------------------
  */
 
@@ -63,25 +67,25 @@ export type StickerPreset = {
  */
 export const STICKER_PRESETS: StickerPreset[] = [
   {
-    label: "ありがとう",
+    label: "ごめんなさい",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "06",
     image_url: "/stickers/orangutan_my_new_06.png",
   },
   {
-    label: "こんにちは",
+    label: "了解",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "29",
     image_url: "/stickers/orangutan_my_new_29.png",
   },
   {
-    label: "了解",
+    label: "こんにちは",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "02",
     image_url: "/stickers/orangutan_my_new_02.png",
   },
   {
-    label: "ごめんなさい",
+    label: "ありがとう",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "03",
     image_url: "/stickers/orangutan_my_new_03.png",
