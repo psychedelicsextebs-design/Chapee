@@ -37,7 +37,10 @@ import {
   HANDLING_STATUS_LABELS,
   HANDLING_STATUS_VALUES,
 } from "@/lib/handling-status";
-import { getStickerPresetsForMarket } from "@/lib/sticker-presets";
+import {
+  getStickerPresetsForMarket,
+  resolveStickerPreviewUrl,
+} from "@/lib/sticker-presets";
 import { ChatSidebarTasksPanel } from "@/components/ChatSidebarTasksPanel";
 
 type AttachedFile = {
@@ -1425,26 +1428,48 @@ export default function ChatDetailPage() {
                       よく使うスタンプ
                     </p>
                     <ul className="grid grid-cols-3 gap-2 mb-3">
-                      {stickerPresets.map((p) => (
-                        <li
-                          key={`preset:${p.sticker_package_id}:${p.sticker_id}`}
-                        >
-                          <button
-                            type="button"
-                            disabled={sending}
-                            onClick={() =>
-                              void handleSendSticker(
-                                p.sticker_package_id,
-                                p.sticker_id
-                              )
-                            }
-                            className="w-full aspect-square rounded-lg border border-primary/30 bg-primary-subtle hover:bg-primary-subtle/70 hover:border-primary/60 transition-colors flex items-center justify-center p-2 text-xs font-semibold text-primary leading-tight text-center"
-                            title={`「${p.label}」を送信`}
+                      {stickerPresets.map((p) => {
+                        // 3 段 fallback (詳細は resolveStickerPreviewUrl の JSDoc 参照):
+                        //   1) preset.image_url → 2) 会話履歴 → 3) ラベル文字
+                        const previewUrl = resolveStickerPreviewUrl(
+                          p,
+                          stickerChoicesFromThread
+                        );
+
+                        return (
+                          <li
+                            key={`preset:${p.sticker_package_id}:${p.sticker_id}`}
                           >
-                            {p.label}
-                          </button>
-                        </li>
-                      ))}
+                            <button
+                              type="button"
+                              disabled={sending}
+                              onClick={() =>
+                                void handleSendSticker(
+                                  p.sticker_package_id,
+                                  p.sticker_id
+                                )
+                              }
+                              className={
+                                previewUrl
+                                  ? "w-full aspect-square rounded-lg border border-primary/30 bg-primary-subtle hover:bg-primary-subtle/70 hover:border-primary/60 transition-colors flex items-center justify-center p-1 overflow-hidden"
+                                  : "w-full aspect-square rounded-lg border border-primary/30 bg-primary-subtle hover:bg-primary-subtle/70 hover:border-primary/60 transition-colors flex items-center justify-center p-2 text-xs font-semibold text-primary leading-tight text-center"
+                              }
+                              title={`「${p.label}」を送信`}
+                            >
+                              {previewUrl ? (
+                                <img
+                                  src={previewUrl}
+                                  alt={p.label}
+                                  referrerPolicy="no-referrer"
+                                  className="max-h-full max-w-full object-contain"
+                                />
+                              ) : (
+                                p.label
+                              )}
+                            </button>
+                          </li>
+                        );
+                      })}
                     </ul>
                     <div className="border-t border-border mb-3" />
                   </>

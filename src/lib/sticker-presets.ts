@@ -37,6 +37,17 @@ export type StickerPreset = {
   sticker_id: string;
   /** 省略時は全市場対応想定。特定市場限定の場合のみ指定 */
   supported_markets?: string[];
+  /**
+   * プレビュー用の画像 URL (任意)。
+   *   未指定時の UI 挙動 (chats/[id]/page.tsx):
+   *     1) この image_url
+   *     2) 会話内の sticker 受信履歴 (stickerChoicesFromThread) から同 ID を検索
+   *     3) どちらも無ければ label テキストにフォールバック
+   *
+   *   URL 投入手順は docs/sticker-url-extraction.md を参照
+   *   (Atlas Web UI 用クエリ + 反映ステップ)。
+   */
+  image_url?: string;
 };
 
 /**
@@ -81,4 +92,31 @@ export function getStickerPresetsForMarket(market?: string): StickerPreset[] {
     if (!p.supported_markets || p.supported_markets.length === 0) return true;
     return p.supported_markets.includes(market);
   });
+}
+
+/** 会話内に出現したスタンプのリスト要素 (chats/[id]/page.tsx の stickerChoicesFromThread と同形) */
+export type StickerThreadChoice = {
+  sticker_id: string;
+  package_id: string;
+  image_url?: string;
+};
+
+/**
+ * プリセットスタンプボタンに表示するプレビュー URL を 3 段 fallback で解決する。
+ *
+ * 1. preset.image_url が指定されていればそれを採用 (定義時に投入された CDN URL)
+ * 2. 会話内に同じ (package_id, sticker_id) ペアの受信履歴があればその image_url
+ * 3. どちらも無ければ undefined → 呼び出し側で label テキストに fallback
+ */
+export function resolveStickerPreviewUrl(
+  preset: Pick<StickerPreset, "sticker_package_id" | "sticker_id" | "image_url">,
+  threadChoices: ReadonlyArray<StickerThreadChoice>
+): string | undefined {
+  if (preset.image_url) return preset.image_url;
+  const found = threadChoices.find(
+    (s) =>
+      s.package_id === preset.sticker_package_id &&
+      s.sticker_id === preset.sticker_id
+  );
+  return found?.image_url;
 }
