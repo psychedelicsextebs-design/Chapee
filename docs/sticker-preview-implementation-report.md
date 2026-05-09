@@ -254,3 +254,108 @@ git branch -D feature/sticker-preview
 - 4 件すべての image_url を確実に取れる保証は無い (オーナーの過去送信履歴 + webhook 同期に
   依存)。 取れなかった ID は merge 後に「Shopee アプリから自分宛にもう一度送信 → 同期 →
   再抽出」で対応可能。 fallback 設計のため URL 0 件でも UI 破綻はない。
+
+---
+
+## 【追加対応 (2026-05-09 第 3 ラウンド) — 自前ホスト方式に切り替え】
+
+### 経緯
+1. 第 1 ラウンドで `image_url?` を optional フィールドとして追加 (値は未投入)
+2. 第 2 ラウンド (admin endpoint) で本番 DB から URL を抽出する経路を構築
+3. 実抽出: **0 / 4 件**。 過去の `shopee_chat_messages` に orangutan_my_new パックの
+   sticker メッセージが 1 件も保存されておらず、Shopee CDN URL を引けなかった
+4. 方針転換: Shopee 公式の sticker 画像 4 枚をオーナーが取得 → `public/stickers/` に
+   同梱する **自前ホスト方式** に切り替え
+
+### 配置済みアセット
+
+```
+public/stickers/orangutan_my_new_02.png   (7,037 B)  — 了解 / OK
+public/stickers/orangutan_my_new_03.png   (6,544 B)  — ごめんなさい / Sorry
+public/stickers/orangutan_my_new_06.png   (7,023 B)  — ありがとう / Thank you
+public/stickers/orangutan_my_new_29.png   (6,229 B)  — こんにちは / Hi
+```
+
+Next.js は `public/` 直下を URL ルート相対で serve するため、ブラウザからは
+`/stickers/orangutan_my_new_NN.png` で取得される。 外部 CDN への依存ゼロ、CORS なし、
+referrer 漏洩なし。
+
+### ラベル変更表 (Shopee 公式 sticker の意図に合わせ整理)
+
+| sticker_id | label (旧) | label (新) | image (Shopee 公式) |
+| --- | --- | --- | --- |
+| 06 | ありがとう | ありがとう | Thank you |
+| 29 | 確認中 | **こんにちは** | Hi |
+| 02 | 了解 | 了解 | OK |
+| 03 | お待たせしました | **ごめんなさい** | Sorry |
+
+### ライセンス判断 (オーナー判断済み)
+
+- 自社ツール内部 UI 用に限定。 二次配布・再販なし。 Shopee Partner ID と access token を
+  使ってメッセージング画面を運用しているセラー (= 当社 Chapee 運用者) のみが目にする
+  内部画像表示。
+- 万が一 Shopee 側から表示停止要請があった場合は、`public/stickers/` 配下の PNG を削除
+  + プリセットの `image_url` を未設定に戻すだけで 3 段 fallback により従来挙動 (ラベル
+  テキスト表示) に戻せる。
+
+### admin endpoint 削除
+
+```
+- app/api/admin/extract-sticker-urls/route.ts  (削除)
+- src/test/extract-sticker-urls.test.ts        (削除、10 ケース)
+```
+
+合計 -490 行。 認証は CRON_SECRET で締めていたので production exposure 期間中の
+リスクは限定的だったが、用済みのため確実に取り除いた。
+
+### 第 3 ラウンドのコミット
+
+```
+5e31193 chore(admin): remove temporary extract-sticker-urls endpoint
+a74b8e0 feat(sticker-presets): self-host 4 sticker images + relabel 29/03
+```
+
+### テスト結果 (第 3 ラウンド後)
+
+```
+sticker-presets.test.ts — 15 / 15 passed (14 → 15、+1 は /stickers/ 経路ガード)
+全体: Test Files 5 passed, Tests 75 passed
+  (auto-reply 31 + health-check 18 + sticker-presets 15 + shopee-webhook-auth 10 + example 1)
+npx tsc --noEmit — エラーなし
+```
+
+extract-sticker-urls.test.ts の 10 件は endpoint 削除に伴って同時に削除済み。
+
+### push 推奨度: **高**
+
+- 4 件すべて image_url 投入済み、 タスク完了条件を 100% 満たす
+- 一時 admin endpoint は完全撤去 (本番に残らない)
+- 既存テスト含めて全件 pass + 型エラーゼロ
+- 自前ホストなので CDN 失効リスクなし、404 もなし
+- 万一の問題時は画像削除 + image_url クリアで即元の文字ボタンに戻せる (3 段 fallback の効果)
+
+### 朝の merge コマンド (確定版)
+
+```cmd
+cd C:\Users\psych\Chapee
+
+:: 差分確認
+git diff main..feature/sticker-preview --stat
+git log main..feature/sticker-preview --oneline
+
+:: 全テスト確認
+npm test
+
+:: merge & push
+git checkout main
+git merge feature/sticker-preview
+git push origin main
+
+:: (任意) リモートの feature ブランチも掃除する場合
+git push origin --delete feature/sticker-preview
+git branch -d feature/sticker-preview
+```
+
+merge 後の Vercel deploy で `/chats/<id>` を開き、「スタンプ」ポップオーバー → 4 つの
+プリセットボタンに画像が表示されることを目視確認。 4 ボタン中いずれかが文字のままなら
+`/stickers/` のファイル配置 / commit 漏れを疑う。
