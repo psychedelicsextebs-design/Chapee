@@ -436,3 +436,102 @@ git branch -d feature/sticker-label-fix
 
 merge 後 deploy で再度プリセットボタンを目視。 02→こんにちは / 03→ありがとう /
 06→ごめんなさい / 29→了解 の組み合わせでラベルと画像が一致することを確認。
+
+---
+
+## 【追加対応 (2026-05-09 第 5 ラウンド) — sticker_id ↔ 真の絵 の最終確定】
+
+### 経緯
+第 4 ラウンドの merge & deploy 後もズレが残っていることが分かり、オーナーが
+**Shopee 実機にテスト送信** して各 sticker_id がどの絵で配信されるかを 1 件ずつ確認。
+これで sticker_id ↔ Shopee 公式絵 の真の対応が確定した:
+
+| sticker_id | 配信される実画 (Shopee 公式絵) |
+| --- | --- |
+| 06 | Thank you (ありがとう) |
+| 29 | Hi (こんにちは) |
+| 02 | OK (了解) |
+| 03 | Sorry (ごめんなさい) |
+
+### 同時対応: 画像アセットも入れ替え
+
+`public/stickers/orangutan_my_new_NN.png` の **ファイル名と sticker_id の対応 (NN ↔ sticker_id=NN) は据え置き** つつ、 各 PNG の **中身 (バイナリ) を真の絵に入れ替え**。
+オーナーが手元で画像を差し替えた状態を本ブランチで commit に取り込んだ。
+
+ファイルサイズの推移 (= 中身入れ替えの根拠):
+
+| ファイル | 第 3 ラウンド (バンドル時) | 第 5 ラウンド (入れ替え後) |
+| --- | --- | --- |
+| `orangutan_my_new_02.png` | 7,037 B | 6,229 B |
+| `orangutan_my_new_03.png` | 6,544 B | 7,023 B |
+| `orangutan_my_new_06.png` | 7,023 B | 6,544 B |
+| `orangutan_my_new_29.png` | 6,229 B | 7,037 B |
+
+完全な rotation。 第 3 ラウンドで張り付けたファイルがそもそも Shopee 公式絵と sticker_id の対応をズラした順序で詰めてあったため、ファイル名据え置きで中身を正しい絵に上書きする形で正規化した。
+
+### ラベル変更内容 (旧 → 新)
+
+| sticker_id | label (第 4 ラウンド適用版) | label (新, 第 5 ラウンド) |
+| --- | --- | --- |
+| 06 | ごめんなさい | **ありがとう** |
+| 29 | 了解 | **こんにちは** |
+| 02 | こんにちは | **了解** |
+| 03 | ありがとう | **ごめんなさい** |
+
+注: 第 5 ラウンド適用後の label 値は第 3 ラウンド時のラベルと文字列としては一致する。
+ただし第 3 ラウンドでは画像中身が誤った絵だったため UI 上ズレており、 今回は画像中身の
+入れ替えと組み合わせて初めて意図通りの組み合わせになる。
+
+### 第 5 ラウンドのコミット
+
+```
+d5bfff4 fix(sticker-presets): finalize labels per Shopee test-send mapping
+6f82b3f assets(stickers): replace 4 sticker PNGs to match true sticker_id mapping
+```
+
+(本レポート commit がさらに 1 件 続く)
+
+### テスト結果
+
+```
+sticker-presets.test.ts — 15 / 15 passed (期待ラベルを真マッピングに更新)
+全体: Test Files 5 passed, Tests 75 passed
+npx tsc --noEmit — エラーなし
+```
+
+### 再発防止メモ
+
+- `sticker_id ↔ 絵` の対応は TS の型でも DB でも検証されない (ラベルは単なる文字列、画像は単なるバイナリ)。 ゆえに「ファイル名と中身が真に一致しているか」「ラベルがどの絵を指しているか」は **実機に実際に送信して目視確認する以外に検証手段が無い**。 第 3〜第 5 ラウンドで往復が発生したのもこれが原因。
+- 今後 sticker パックを追加する際は、追加と同時に Shopee 実機への 1 件送信 → 受信側で確認 → ファイル名 / ラベルを確定 → commit、 という運用にすると往復が防げる。
+
+### push 推奨度: **高**
+
+- 既存ロジック非変更
+- アセット (PNG) 4 件 + データファイル (`sticker-presets.ts`) 1 件 + テスト 1 件 + 本レポート 1 件
+- main から派生、 fast-forward merge 可能
+- 全テスト pass + 型エラーゼロ + 真マッピング確定済み
+
+### 朝の merge コマンド (第 5 ラウンド用)
+
+```cmd
+cd C:\Users\psych\Chapee
+
+:: 差分確認
+git diff main..feature/sticker-final-fix --stat
+git log main..feature/sticker-final-fix --oneline
+
+:: 全テスト確認
+npm test
+
+:: merge & push
+git checkout main
+git merge feature/sticker-final-fix
+git push origin main
+
+:: (任意) feature ブランチを掃除
+git push origin --delete feature/sticker-final-fix
+git branch -d feature/sticker-final-fix
+```
+
+merge 後 deploy で「スタンプ」ポップオーバーを開き、 **真マッピングと表示が一致**
+していることを目視確認。 これ以降ズレが残っていなければ第 5 ラウンドで完結。
