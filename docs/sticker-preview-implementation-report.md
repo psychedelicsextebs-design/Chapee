@@ -359,3 +359,80 @@ git branch -d feature/sticker-preview
 merge 後の Vercel deploy で `/chats/<id>` を開き、「スタンプ」ポップオーバー → 4 つの
 プリセットボタンに画像が表示されることを目視確認。 4 ボタン中いずれかが文字のままなら
 `/stickers/` のファイル配置 / commit 漏れを疑う。
+
+---
+
+## 【追加対応 (2026-05-09 第 4 ラウンド) — ラベル対応修正】
+
+### 経緯
+第 3 ラウンドの merge 後、 `/chats/<id>` を開いてプリセットボタンを目視したところ、
+画像と label の組み合わせがズレていることをオーナーが発見。 第 3 ラウンドで投入した
+ラベルは Shopee 公式 sticker の意味とは別の組み合わせになっていた。
+画像ファイル (`public/stickers/orangutan_my_new_NN.png`) は最初から正しい意図で配置
+されていたため、**ラベル側の組み合わせのみ修正** で対応する。
+
+### 旧 → 新 ラベル対応表
+
+| sticker_id | 画像 (Shopee 公式の意図) | label (旧, 第 3 ラウンド) | label (新, 第 4 ラウンド) |
+| --- | --- | --- | --- |
+| 02 | Hi | 了解 | **こんにちは** |
+| 03 | Thank you | ごめんなさい | **ありがとう** |
+| 06 | Sorry | ありがとう | **ごめんなさい** |
+| 29 | OK | こんにちは | **了解** |
+
+### 変更点
+
+- [src/lib/sticker-presets.ts](../src/lib/sticker-presets.ts) — `STICKER_PRESETS` 配列の 4 件すべての
+  `label` を新対応に。 `image_url` / `sticker_package_id` / `sticker_id` は触らない。
+- [src/test/sticker-presets.test.ts](../src/test/sticker-presets.test.ts) — `each preset uses correct
+  package id...` テスト内のラベル期待値を新対応に追従。
+- ヘッダコメントの履歴に「2026-05-09: ラベル対応修正」エントリを追加。
+
+### 修正理由
+
+「オーナー目視確認でズレ判明」 — 自動検知できる種類のバグではない (label と画像の意味
+ペアリングは TS の型でも DB でも検証されていない)。 今後同種ズレの再発防止には
+スクリーンショットベース or オーナー目視レビューが必要。
+
+### 第 4 ラウンドのコミット
+
+(本ラウンド commit 一覧は本レポート commit 後に表示される。 `git log main..feature/sticker-label-fix --oneline` で確認)
+
+### テスト結果 (第 4 ラウンド後)
+
+```
+sticker-presets.test.ts — 15 / 15 passed (期待ラベル更新)
+全体: Test Files 5 passed, Tests 75 passed
+npx tsc --noEmit — エラーなし
+```
+
+### push 推奨度: **高**
+
+- 1 ファイル (実コード) + 1 ファイル (テスト) + 1 ファイル (本レポート) = 3 ファイル変更のみ
+- ロジック変更ゼロ、文字列変更のみ
+- merge は fast-forward 可能 (main から派生したブランチ、main は第 3 ラウンドで停止しているため)
+
+### 朝の merge コマンド (確定版、第 4 ラウンド用)
+
+```cmd
+cd C:\Users\psych\Chapee
+
+:: 差分確認
+git diff main..feature/sticker-label-fix --stat
+git log main..feature/sticker-label-fix --oneline
+
+:: 全テスト確認
+npm test
+
+:: merge & push
+git checkout main
+git merge feature/sticker-label-fix
+git push origin main
+
+:: (任意) リモート / ローカルの feature ブランチを掃除
+git push origin --delete feature/sticker-label-fix
+git branch -d feature/sticker-label-fix
+```
+
+merge 後 deploy で再度プリセットボタンを目視。 02→こんにちは / 03→ありがとう /
+06→ごめんなさい / 29→了解 の組み合わせでラベルと画像が一致することを確認。
