@@ -178,23 +178,37 @@ describe("STICKER_PRESETS — orangutan_my_new pack coverage", () => {
   });
 
   it("each preset uses correct package id 'orangutan_my_new' for the pack", () => {
-    const labels = ["ありがとう", "確認中", "了解", "お待たせしました"];
-    for (const label of labels) {
-      const found = STICKER_PRESETS.find((p) => p.label === label);
+    // ラベルは UI 仕様変更に追従 (06=ありがとう / 29=こんにちは / 02=了解 / 03=ごめんなさい)
+    const expected: Array<{ sticker_id: string; label: string }> = [
+      { sticker_id: "06", label: "ありがとう" },
+      { sticker_id: "29", label: "こんにちは" },
+      { sticker_id: "02", label: "了解" },
+      { sticker_id: "03", label: "ごめんなさい" },
+    ];
+    for (const e of expected) {
+      const found = STICKER_PRESETS.find(
+        (p) => p.sticker_id === e.sticker_id && p.sticker_package_id === "orangutan_my_new"
+      );
       expect(found).toBeDefined();
-      expect(found!.sticker_package_id).toBe("orangutan_my_new");
+      expect(found!.label).toBe(e.label);
     }
   });
 
-  // 配置の備忘: STEP 1 で抽出した URL 投入後、ここで存在を assert したくなる気持ちは
-  // あるが「URL 値固定 = テストが UI 体験を保証しない (URL 失効しても pass する)」
-  // なので 4 件すべて image_url 必須の assert はしない。 投入 0/4 でも pass する。
-  // 投入された URL が https:// 形式であることだけは検証する。
-  it("any image_url present must be a valid https URL", () => {
+  // 投入された image_url は https URL または public/ 直下のルート相対パス
+  // ("/stickers/...") のいずれか。 Shopee CDN を使う将来の選択肢を残すため両対応。
+  it("image_url is either an https URL or a root-relative public path", () => {
     for (const p of STICKER_PRESETS) {
       if (p.image_url) {
-        expect(p.image_url).toMatch(/^https:\/\//);
+        expect(p.image_url).toMatch(/^(https:\/\/|\/)/);
       }
+    }
+  });
+
+  // public/stickers/ 自前ホスト (現行解): 4 種すべてルート相対の /stickers/ 配下
+  it("each preset has an image_url pointing to /stickers/orangutan_my_new_<id>.png", () => {
+    for (const p of STICKER_PRESETS) {
+      if (p.sticker_package_id !== "orangutan_my_new") continue;
+      expect(p.image_url).toBe(`/stickers/orangutan_my_new_${p.sticker_id}.png`);
     }
   });
 });

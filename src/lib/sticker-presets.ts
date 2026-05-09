@@ -25,6 +25,11 @@
  * 【最終取得日】
  *  2026-04-19: 初期スケルトン（ID 未投入）
  *  2026-04-19: orangutan_my_new パックの4種を投入（ありがとう/確認中/了解/お待たせしました）
+ *  2026-05-09: ラベル整理 + image_url 投入。
+ *              ラベル: 確認中→こんにちは / お待たせしました→ごめんなさい
+ *                      (Shopee 公式 sticker の意図に合わせ整理)
+ *              image_url: public/stickers/ に同梱した PNG をルート相対パスで参照。
+ *                         Shopee CDN を直接叩く案は DB 抽出 0 件で見送り。
  * ------------------------------------------------------------------
  */
 
@@ -44,8 +49,10 @@ export type StickerPreset = {
    *     2) 会話内の sticker 受信履歴 (stickerChoicesFromThread) から同 ID を検索
    *     3) どちらも無ければ label テキストにフォールバック
    *
-   *   URL 投入手順は docs/sticker-url-extraction.md を参照
-   *   (Atlas Web UI 用クエリ + 反映ステップ)。
+   *   現在は Shopee 公式画像 4 枚を public/stickers/ に自前ホストし、
+   *   ルート相対パス ("/stickers/...") を指定している。
+   *   Shopee CDN 経由案 (docs/sticker-url-extraction.md) は DB 抽出 0 件の
+   *   ため見送り、自社ツール内部 UI 用途に限定して画像を同梱する形に変更。
    */
   image_url?: string;
 };
@@ -59,21 +66,25 @@ export const STICKER_PRESETS: StickerPreset[] = [
     label: "ありがとう",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "06",
+    image_url: "/stickers/orangutan_my_new_06.png",
   },
   {
-    label: "確認中",
+    label: "こんにちは",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "29",
+    image_url: "/stickers/orangutan_my_new_29.png",
   },
   {
     label: "了解",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "02",
+    image_url: "/stickers/orangutan_my_new_02.png",
   },
   {
-    label: "お待たせしました",
+    label: "ごめんなさい",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "03",
+    image_url: "/stickers/orangutan_my_new_03.png",
   },
 ];
 
