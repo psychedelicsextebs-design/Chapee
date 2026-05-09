@@ -34,6 +34,11 @@
  *              02:こんにちは / 03:ありがとう / 06:ごめんなさい / 29:了解
  *              画像ファイル (public/stickers/orangutan_my_new_NN.png) は元から
  *              正しい意図で配置済みで、ラベル側の組み合わせだけがズレていた。
+ *  2026-05-09: テスト送信で sticker_id ↔ 真の絵 を最終確定。
+ *              06:ありがとう (Thank you) / 29:こんにちは (Hi) /
+ *              02:了解 (OK)        / 03:ごめんなさい (Sorry)
+ *              public/stickers/ の PNG 4 枚はオーナー手動で中身を入れ替え済み。
+ *              ファイル名と sticker_id の対応 (NN.png ↔ sticker_id=NN) は不変。
  * ------------------------------------------------------------------
  */
 
@@ -67,25 +72,25 @@ export type StickerPreset = {
  */
 export const STICKER_PRESETS: StickerPreset[] = [
   {
-    label: "ごめんなさい",
+    label: "ありがとう",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "06",
     image_url: "/stickers/orangutan_my_new_06.png",
   },
   {
-    label: "了解",
+    label: "こんにちは",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "29",
     image_url: "/stickers/orangutan_my_new_29.png",
   },
   {
-    label: "こんにちは",
+    label: "了解",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "02",
     image_url: "/stickers/orangutan_my_new_02.png",
   },
   {
-    label: "ありがとう",
+    label: "ごめんなさい",
     sticker_package_id: "orangutan_my_new",
     sticker_id: "03",
     image_url: "/stickers/orangutan_my_new_03.png",

@@ -178,13 +178,14 @@ describe("STICKER_PRESETS — orangutan_my_new pack coverage", () => {
   });
 
   it("each preset uses correct package id 'orangutan_my_new' for the pack", () => {
-    // ラベル対応 (2026-05-09 オーナー目視確認で再修正):
-    //   02=こんにちは / 03=ありがとう / 06=ごめんなさい / 29=了解
+    // ラベル対応 (2026-05-09 第 5 ラウンドでテスト送信により最終確定):
+    //   06=ありがとう (Thank you) / 29=こんにちは (Hi) /
+    //   02=了解       (OK)         / 03=ごめんなさい (Sorry)
     const expected: Array<{ sticker_id: string; label: string }> = [
-      { sticker_id: "02", label: "こんにちは" },
-      { sticker_id: "03", label: "ありがとう" },
-      { sticker_id: "06", label: "ごめんなさい" },
-      { sticker_id: "29", label: "了解" },
+      { sticker_id: "06", label: "ありがとう" },
+      { sticker_id: "29", label: "こんにちは" },
+      { sticker_id: "02", label: "了解" },
+      { sticker_id: "03", label: "ごめんなさい" },
     ];
     for (const e of expected) {
       const found = STICKER_PRESETS.find(
