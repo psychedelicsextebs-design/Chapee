@@ -24,10 +24,13 @@ import { getCollection } from "@/lib/mongodb";
  *     triggerHour 設定がない国は scan 対象外
  *
  * 注意:
- *   - 設計書の `status !== "resolved"` は実 schema (HandlingStatus =
- *     "unreplied" | "auto_replied_pending" | "in_progress" | "completed")
- *     と整合しないため、対応完了を除外する設計意図を尊重して
- *     `handling_status !== "completed"` で実装している。
+ *   - 対応完了済みの除外は `handling_status !== "completed"` AND legacy field
+ *     `status !== "resolved"` の両方で行う。 Atlas 上の sunrainsky レコード
+ *     確認 (2026-05-09) で過去データに `status: "resolved"` が残存しており、
+ *     片方だけだと検知漏れが発生するため。
+ *   - country は `toUpperCase` で保存される運用だが、過去データに小文字が
+ *     混在している可能性に備え、Mongo $in 側で大小両ケースを並べる + アプリ層で
+ *     `toUpperCase` 正規化してから triggerHour を引く。
  */
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -118,6 +121,9 @@ export async function findMissedConversations(
   const maxWindowH = Math.max(0, maxTrigger - WINDOW_MARGIN_HOURS);
   const cutoff = new Date(nowMs - maxWindowH * HOUR_MS);
 
+  // country: 大小両ケースを許容 ($in で uppercase / lowercase 両方を並べる)。
+  const countryVariants = eligibleKeys.flatMap((c) => [c, c.toLowerCase()]);
+
   const col = await getCollection<ConvDoc>("shopee_conversations");
   const docs = await col
     .find({
@@ -125,8 +131,13 @@ export async function findMissedConversations(
       customer_id: { $gt: 0 },
       last_message_time: { $gte: cutoff },
       auto_reply_pending: { $ne: true },
-      handling_status: { $ne: "completed" },
-      country: { $in: eligibleKeys },
+      // 対応完了の除外: 新フィールド handling_status と legacy フィールド status の
+      // 両方を AND で条件付け。 過去データ互換 (sunrainsky 級漏れ防止)。
+      $and: [
+        { handling_status: { $ne: "completed" } },
+        { status: { $ne: "resolved" } },
+      ],
+      country: { $in: countryVariants },
     })
     .sort({ last_message_time: -1 })
     .limit(HEALTH_CHECK_MAX_SCAN)

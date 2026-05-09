@@ -189,11 +189,13 @@ describe("findMissedConversations", () => {
     const result = await findMissedConversations(NOW);
     expect(result.missed_count).toBe(0);
 
-    // Verify the Mongo query restricted country: $in to configured ones (SG only).
+    // Verify the Mongo query restricted country: $in to configured ones (SG only,
+    // both upper/lower case for case-insensitive matching against legacy data).
     const findCall = mockConvCol.find.mock.calls[0][0] as Record<string, unknown>;
     expect(findCall).toHaveProperty("country");
     const countryClause = findCall.country as { $in?: string[] };
-    expect(countryClause.$in).toEqual(["SG"]);
+    expect(countryClause.$in).toEqual(expect.arrayContaining(["SG", "sg"]));
+    expect(countryClause.$in).toHaveLength(2); // SG / sg のみ。 PH 系は含まない。
   });
 
   it("Case 4b: when no countries are configured at all, returns empty without querying conversations", async () => {
@@ -265,9 +267,131 @@ describe("findMissedConversations", () => {
     expect(filter.chat_type).toEqual({ $ne: "notification" });
     expect(filter.customer_id).toEqual({ $gt: 0 });
     expect(filter.auto_reply_pending).toEqual({ $ne: true });
-    expect(filter.handling_status).toEqual({ $ne: "completed" });
     expect(filter).toHaveProperty("last_message_time");
     expect(filter).toHaveProperty("country");
+
+    // 修正1: handling_status と legacy status の両方を $and で除外
+    const and = filter.$and as Array<Record<string, unknown>>;
+    expect(Array.isArray(and)).toBe(true);
+    expect(and).toEqual(
+      expect.arrayContaining([
+        { handling_status: { $ne: "completed" } },
+        { status: { $ne: "resolved" } },
+      ])
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 修正1: legacy `status` フィールド対応
+  // Atlas で sunrainsky レコードに status:"resolved" が残っていた事案。
+  // handling_status だけでなく status も除外しないと検知漏れする。
+  // ---------------------------------------------------------------------------
+  it("excludes docs with legacy status='resolved' via Mongo filter", async () => {
+    mockSettingsCol.findOne.mockResolvedValue(settingsWith({ SG: { triggerHour: 12 } }));
+    mockFindReturn([]);
+    await findMissedConversations(Date.UTC(2026, 4, 9, 8, 0, 0));
+    const filter = mockConvCol.find.mock.calls[0][0] as Record<string, unknown>;
+    const and = filter.$and as Array<Record<string, unknown>>;
+    expect(and).toContainEqual({ status: { $ne: "resolved" } });
+  });
+
+  it("excludes docs with handling_status='completed' via Mongo filter", async () => {
+    mockSettingsCol.findOne.mockResolvedValue(settingsWith({ SG: { triggerHour: 12 } }));
+    mockFindReturn([]);
+    await findMissedConversations(Date.UTC(2026, 4, 9, 8, 0, 0));
+    const filter = mockConvCol.find.mock.calls[0][0] as Record<string, unknown>;
+    const and = filter.$and as Array<Record<string, unknown>>;
+    expect(and).toContainEqual({ handling_status: { $ne: "completed" } });
+  });
+
+  it("picks up doc with both handling_status and status unset (regression)", async () => {
+    const NOW = Date.UTC(2026, 4, 9, 8, 0, 0);
+    const LMT = NOW - 30 * 60_000;
+    mockSettingsCol.findOne.mockResolvedValue(settingsWith({ SG: { triggerHour: 12 } }));
+    mockFindReturn([
+      {
+        conversation_id: "c_unset",
+        customer_name: "u",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: 1,
+        last_message_time: new Date(LMT),
+        auto_reply_pending: false,
+        last_auto_reply_at: null,
+        // handling_status / status とも未設定
+      },
+    ]);
+    const result = await findMissedConversations(NOW);
+    expect(result.missed_count).toBe(1);
+    expect(result.missed_conversations[0].conversation_id).toBe("c_unset");
+  });
+
+  // ---------------------------------------------------------------------------
+  // 修正2: country case-insensitive 対応
+  // 過去データに小文字保存があってもヒットさせる。
+  // ---------------------------------------------------------------------------
+  it("country filter $in includes both uppercase and lowercase variants", async () => {
+    mockSettingsCol.findOne.mockResolvedValue(
+      settingsWith({ SG: { triggerHour: 12 }, MY: { triggerHour: 10 } })
+    );
+    mockFindReturn([]);
+    await findMissedConversations(Date.UTC(2026, 4, 9, 8, 0, 0));
+    const filter = mockConvCol.find.mock.calls[0][0] as Record<string, unknown>;
+    const countryClause = filter.country as { $in?: string[] };
+    expect(countryClause.$in).toEqual(
+      expect.arrayContaining(["SG", "sg", "MY", "my"])
+    );
+    // PH (設定なし) は含まれない
+    expect(countryClause.$in).not.toContain("PH");
+    expect(countryClause.$in).not.toContain("ph");
+  });
+
+  it("picks up doc with country='sg' (lowercase legacy data)", async () => {
+    const NOW = Date.UTC(2026, 4, 9, 8, 0, 0);
+    const LMT = NOW - 30 * 60_000;
+    mockSettingsCol.findOne.mockResolvedValue(settingsWith({ SG: { triggerHour: 12 } }));
+    mockFindReturn([
+      {
+        conversation_id: "c_lower",
+        customer_name: "u_lower",
+        shop_id: SHOP_ID,
+        country: "sg", // ← 小文字
+        customer_id: 1,
+        last_message_time: new Date(LMT),
+        auto_reply_pending: false,
+        last_auto_reply_at: null,
+        handling_status: "unreplied",
+      },
+    ]);
+    const result = await findMissedConversations(NOW);
+    expect(result.missed_count).toBe(1);
+    const m = result.missed_conversations[0];
+    expect(m.conversation_id).toBe("c_lower");
+    // レスポンス上は uppercase に正規化されている
+    expect(m.country).toBe("SG");
+    expect(m.trigger_hour).toBe(12);
+  });
+
+  it("picks up doc with country='SG' (uppercase, normal path)", async () => {
+    const NOW = Date.UTC(2026, 4, 9, 8, 0, 0);
+    const LMT = NOW - 30 * 60_000;
+    mockSettingsCol.findOne.mockResolvedValue(settingsWith({ SG: { triggerHour: 12 } }));
+    mockFindReturn([
+      {
+        conversation_id: "c_upper",
+        customer_name: "u_upper",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: 1,
+        last_message_time: new Date(LMT),
+        auto_reply_pending: false,
+        last_auto_reply_at: null,
+        handling_status: "unreplied",
+      },
+    ]);
+    const result = await findMissedConversations(NOW);
+    expect(result.missed_count).toBe(1);
+    expect(result.missed_conversations[0].country).toBe("SG");
   });
 });
 
