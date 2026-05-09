@@ -128,6 +128,49 @@ describe("classifyShopeeMessageSender", () => {
     // This ensures we never schedule an auto-reply from a message we can't attribute.
     expect(classifyShopeeMessageSender({ from_id: 123 }, 0)).toBe("staff");
   });
+
+  // Patch D regression: 5/7 sunrainsky 案件で観測された「buyer 商品カード問い合わせ」
+  // (message_type=item) は from_id=0 で配信されるが to_id=shop_id を持つ。
+  // shop_id を渡せば buyer 発信として正しく分類されるべき。
+  it("returns 'buyer' when from_id=0 but to_id === shop_id (Patch D: item-card fallback)", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+    // alt key (to_user_id) も拾えること
+    expect(
+      classifyShopeeMessageSender(
+        { from_user_id: 0, to_user_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  // 後方互換: shop_id を渡さなければ Patch D は発動せず従来挙動 ("unknown") を維持。
+  it("returns 'unknown' when from_id=0 to_id=shop_id but shop_id NOT supplied (back-compat)", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID
+        // shop_id 省略
+      )
+    ).toBe("unknown");
+  });
+
+  // shop_id を渡しても to_id が shop_id でも customer_id でもなければ "unknown"。
+  it("returns 'unknown' when from_id=0 and to_id matches neither customer_id nor shop_id", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { from_id: 0, to_id: 999_999_999 },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
 });
 
 describe("computeBuyerStaffLastMs", () => {
@@ -185,6 +228,35 @@ describe("computeBuyerStaffLastMs", () => {
     );
     expect(r.lastBuyerMs).toBe(tBuyer);
     expect(r.lastStaffMs).toBe(tSticker);
+  });
+
+  // Patch D 効果: from_id=0 + to_id=shop_id (商品カード問い合わせ) を shop_id 渡しで buyer 扱い。
+  // sunrainsky 漏れの構造的弱点に対する救済が computeBuyerStaffLastMs まで貫通することの確認。
+  it("counts from_id=0 + to_id=shop_id item-card as buyer when shop_id supplied (Patch D integration)", () => {
+    const tItemCard = 1_700_000_000_000;
+    const r = computeBuyerStaffLastMs(
+      [
+        { from_id: 0, to_id: SHOP_ID, timestamp: Math.floor(tItemCard / 1000) },
+      ],
+      CUSTOMER_ID,
+      SHOP_ID
+    );
+    expect(r.lastBuyerMs).toBe(tItemCard);
+    expect(r.lastStaffMs).toBe(0);
+  });
+
+  // 後方互換: shop_id 未指定なら Patch D 発動せず従来通り unknown 扱い (lastBuyer=0)。
+  it("ignores from_id=0 + to_id=shop_id when shop_id NOT supplied (back-compat)", () => {
+    const tItemCard = 1_700_000_000_000;
+    const r = computeBuyerStaffLastMs(
+      [
+        { from_id: 0, to_id: SHOP_ID, timestamp: Math.floor(tItemCard / 1000) },
+      ],
+      CUSTOMER_ID
+      // shop_id 省略
+    );
+    expect(r.lastBuyerMs).toBe(0);
+    expect(r.lastStaffMs).toBe(0);
   });
 });
 

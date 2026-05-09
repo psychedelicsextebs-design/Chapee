@@ -26,6 +26,12 @@ import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
  *   from_id が 0 でも、`to_id === customer_id` なら「buyer 宛」=「staff 送信」と
  *   断定できる。 buyer 宛だけを確定処理し、それ以外の不明ケースは "unknown" のまま。
  *
+ * Patch D (shop 宛 = buyer 発信):
+ *   商品カード問い合わせ (message_type=item) 等は from_id=0 で配信されるが、
+ *   to_id には shop_id が入る。 shopId が判明していれば to_id === shopId のとき
+ *   「shop 宛」=「buyer 発信」と断定できる (5/7 sunrainsky 案件の構造的弱点対応)。
+ *   shopId は optional — 未指定なら従来挙動 (Patch A/B のみ) を維持する。
+ *
  * Patch B (unknown default 維持):
  *   from_id=0 かつ to_id でも向きが特定できない場合は引き続き "unknown" を返す。
  *   呼び出し側は "unknown" を buyer/staff いずれの最終時刻にも採用しないため、
@@ -33,10 +39,12 @@ import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
  */
 export function classifyShopeeMessageSender(
   msg: Record<string, unknown>,
-  customerId: number
+  customerId: number,
+  shopId?: number
 ): "buyer" | "staff" | "unknown" {
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
   const buyer = Number(customerId);
+  const shop = Number(shopId ?? 0);
 
   if (Number.isFinite(fromId) && fromId > 0) {
     if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) return "buyer";
@@ -45,13 +53,15 @@ export function classifyShopeeMessageSender(
 
   // Patch A: from_id=0 — sticker / system card 等。to_id で向きを推定する。
   const toId = Number(msg.to_id ?? msg.to_user_id ?? 0);
-  if (
-    Number.isFinite(toId) && toId > 0 &&
-    Number.isFinite(buyer) && buyer > 0 &&
-    toId === buyer
-  ) {
-    // 「buyer 宛」が確定した → 送信者は staff 側 (shop or sub-account)。
-    return "staff";
+  if (Number.isFinite(toId) && toId > 0) {
+    if (Number.isFinite(buyer) && buyer > 0 && toId === buyer) {
+      // 「buyer 宛」が確定した → 送信者は staff 側 (shop or sub-account)。
+      return "staff";
+    }
+    // Patch D: 「shop 宛」が確定した → 送信者は buyer 側 (商品カード問い合わせ等)。
+    if (Number.isFinite(shop) && shop > 0 && toId === shop) {
+      return "buyer";
+    }
   }
 
   // Patch B: それ以外 (to_id 不明 / 0 / customer_id 不明) は "unknown" のまま。
@@ -64,12 +74,13 @@ export function classifyShopeeMessageSender(
  */
 export function computeBuyerStaffLastMs(
   rawMessages: Record<string, unknown>[],
-  customerId: number
+  customerId: number,
+  shopId?: number
 ): { lastBuyerMs: number; lastStaffMs: number } {
   let lastBuyerMs = 0;
   let lastStaffMs = 0;
   for (const msg of rawMessages) {
-    const kind = classifyShopeeMessageSender(msg, customerId);
+    const kind = classifyShopeeMessageSender(msg, customerId, shopId);
     if (kind === "unknown") continue;
     const ts = shopeeMessageTimeToMs(
       msg.timestamp ?? msg.created_timestamp ?? msg.time
@@ -306,7 +317,8 @@ export async function reviewAutoReplySchedule(
     // user_id. Anything that isn't from customer_id is staff-side.
     const { lastBuyerMs, lastStaffMs } = computeBuyerStaffLastMs(
       rawMessages,
-      customerId
+      customerId,
+      shopId
     );
 
     if (lastBuyerMs === 0) {
@@ -566,7 +578,7 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
      * buyer ではない（= スタッフ側からの送信）なら送らずキャンセル。
      */
     const { lastBuyerMs: guardBuyerMs, lastStaffMs: guardStaffMs } =
-      computeBuyerStaffLastMs(rawList, customerIdNum);
+      computeBuyerStaffLastMs(rawList, customerIdNum, shopId);
     if (guardBuyerMs === 0 || guardStaffMs >= guardBuyerMs) {
       await clearAutoReplySchedule(convId, shopId);
       console.log(
