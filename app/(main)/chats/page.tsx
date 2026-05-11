@@ -8,7 +8,7 @@ import {
   AlertCircle, Loader2, RefreshCw, Download,
   MessageSquarePlus,
 } from "lucide-react";
-import BuyerSearchDialog from "@/components/BuyerSearchDialog";
+import ColdStartSendModal, { type ColdStartSendTarget } from "@/components/ColdStartSendModal";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -48,6 +48,35 @@ type ChatRow = {
   last_staff_send_kind?: LastStaffSendKind | null;
 };
 
+type ColdStartBuyer = {
+  shop_id: number;
+  buyer_user_id: number;
+  buyer_username: string;
+  order_sn: string;
+  order_create_time: string;
+  item_preview: string;
+  currency: string;
+  total_amount: number;
+  has_conversation: boolean;
+  conversation_id: string | null;
+};
+
+const COLD_START_DEBOUNCE_MS = 500;
+const COLD_START_MIN_CHARS = 2;
+
+function formatColdStartDate(iso: string): string {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleDateString("ja-JP", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
 export default function ChatsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -55,7 +84,6 @@ export default function ChatsPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [fetching, setFetching] = useState(false);
-  const [buyerSearchOpen, setBuyerSearchOpen] = useState(false);
   const [selectedCountry, setSelectedCountry] = useState("全て");
   const [selectedHandling, setSelectedHandling] = useState<HandlingStatus | "all">("all");
   const [search, setSearch] = useState("");
@@ -63,6 +91,11 @@ export default function ChatsPage() {
   const [selectedChats, setSelectedChats] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
+
+  // コールドスタート検索 (会話なし注文バイヤー)
+  const [coldStartResults, setColdStartResults] = useState<ColdStartBuyer[]>([]);
+  const [coldStartLoading, setColdStartLoading] = useState(false);
+  const [sendTarget, setSendTarget] = useState<ColdStartSendTarget | null>(null);
 
   useEffect(() => {
     const c = searchParams.get("country");
@@ -79,6 +112,43 @@ export default function ChatsPage() {
   useEffect(() => {
     setCurrentPage(1);
   }, [selectedHandling, selectedCountry, unreadOnly, search]);
+
+  // コールドスタート検索: 検索文字列が 2 文字以上の時、 500ms デバウンスで全 shop 並列検索
+  useEffect(() => {
+    const trimmed = search.trim();
+    if (trimmed.length < COLD_START_MIN_CHARS) {
+      setColdStartResults([]);
+      setColdStartLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setColdStartLoading(true);
+    const handle = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ q: trimmed, days: "30" });
+        const res = await fetch(`/api/buyers/search?${params.toString()}`);
+        if (!res.ok) {
+          if (!cancelled) setColdStartResults([]);
+          return;
+        }
+        const data = (await res.json()) as { buyers?: ColdStartBuyer[] };
+        if (!cancelled) {
+          // 会話なしのバイヤーのみ表示 (会話ありは既存リストが拾う)
+          const filtered = (data.buyers ?? []).filter((b) => !b.has_conversation);
+          setColdStartResults(filtered);
+        }
+      } catch (e) {
+        console.error("[ChatsPage] cold-start search:", e);
+        if (!cancelled) setColdStartResults([]);
+      } finally {
+        if (!cancelled) setColdStartLoading(false);
+      }
+    }, COLD_START_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [search]);
 
   const loadChats = useCallback(async () => {
     const res = await fetch(
@@ -276,15 +346,6 @@ export default function ChatsPage() {
           <Button
             variant="default"
             size="sm"
-            onClick={() => setBuyerSearchOpen(true)}
-            className="gap-2 rounded-xl"
-          >
-            <MessageSquarePlus size={16} />
-            新規メッセージ
-          </Button>
-          <Button
-            variant="default"
-            size="sm"
             onClick={handleFetchMessages}
             disabled={fetching || loading}
             className="gap-2 rounded-xl"
@@ -329,11 +390,17 @@ export default function ChatsPage() {
         <div className="relative">
           <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
           <Input
-            placeholder="顧客名・商品名・メッセージ・アイテムIDで検索（スペース区切りで複数キーワード可）"
+            placeholder="顧客名・商品名・メッセージ・注文ID・バイヤー名で検索（2文字以上で会話なし注文も検索）"
             value={search}
             onChange={e => setSearch(e.target.value)}
             className="pl-10 rounded-xl border-gray-200"
           />
+          {coldStartLoading && (
+            <Loader2
+              size={16}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 animate-spin"
+            />
+          )}
         </div>
 
         {/* Country Filter */}
@@ -607,9 +674,96 @@ export default function ChatsPage() {
         )}
       </div>
 
-      <BuyerSearchDialog
-        open={buyerSearchOpen}
-        onOpenChange={setBuyerSearchOpen}
+      {/* Cold-start results (会話なし注文バイヤー) */}
+      {search.trim().length >= COLD_START_MIN_CHARS && (coldStartLoading || coldStartResults.length > 0) && (
+        <div className="bg-white rounded-2xl border border-amber-200 shadow-sm overflow-hidden">
+          <div className="px-4 py-3 border-b border-amber-200 bg-amber-50/40">
+            <h3 className="text-sm font-semibold text-amber-900 flex items-center gap-2">
+              <MessageSquarePlus size={16} />
+              会話なし注文バイヤー
+              {!coldStartLoading && (
+                <span className="text-xs font-normal text-amber-700">
+                  ({coldStartResults.length} 件)
+                </span>
+              )}
+            </h3>
+            <p className="text-[11px] text-amber-700 mt-1">
+              全 shop の過去 30 日の注文から、まだ会話のないバイヤーを検索しています
+            </p>
+          </div>
+          {coldStartLoading ? (
+            <div className="flex items-center justify-center py-6 text-sm text-gray-500 gap-2">
+              <Loader2 size={14} className="animate-spin" />
+              検索中...
+            </div>
+          ) : coldStartResults.length === 0 ? null : (
+            <ul className="divide-y divide-amber-100">
+              {coldStartResults.map((r) => (
+                <li
+                  key={`${r.shop_id}-${r.order_sn}-${r.buyer_user_id}`}
+                  className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-amber-50/30"
+                >
+                  <div className="flex-1 min-w-0 space-y-0.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-medium text-sm text-gray-900">
+                        {r.buyer_username}
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-amber-100 text-amber-800">
+                        会話なし
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-gray-100 text-gray-700">
+                        shop {r.shop_id}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-600 truncate">
+                      {r.order_sn} · {r.item_preview || "—"}
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      {formatColdStartDate(r.order_create_time)}
+                      {r.total_amount > 0 &&
+                        ` · ${r.currency} ${r.total_amount.toLocaleString()}`}
+                    </div>
+                  </div>
+                  <div className="flex-shrink-0">
+                    <Button
+                      size="sm"
+                      onClick={() =>
+                        setSendTarget({
+                          shop_id: r.shop_id,
+                          buyer_user_id: r.buyer_user_id,
+                          buyer_username: r.buyer_username,
+                          order_sn: r.order_sn,
+                          item_preview: r.item_preview,
+                          has_conversation: r.has_conversation,
+                        })
+                      }
+                      className="gap-1.5"
+                    >
+                      <MessageSquarePlus size={14} />
+                      メッセージを送る
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <ColdStartSendModal
+        target={sendTarget}
+        onClose={() => setSendTarget(null)}
+        onSent={(t) => {
+          // 送信成功後 → 該当行を結果から削除 (会話が成立したので「会話なし」では無くなる)
+          setColdStartResults((prev) =>
+            prev.filter(
+              (r) =>
+                !(r.shop_id === t.shop_id && r.buyer_user_id === t.buyer_user_id),
+            ),
+          );
+          // チャット一覧も更新
+          void loadChats();
+        }}
       />
     </div>
   );
