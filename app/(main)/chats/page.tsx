@@ -6,7 +6,9 @@ import {
   Search, Users as UsersIcon,
   ChevronRight, User,
   AlertCircle, Loader2, RefreshCw, Download,
+  MessageSquarePlus,
 } from "lucide-react";
+import BuyerSearchDialog from "@/components/BuyerSearchDialog";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -53,6 +55,7 @@ export default function ChatsPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [fetching, setFetching] = useState(false);
+  const [buyerSearchOpen, setBuyerSearchOpen] = useState(false);
   const [selectedCountry, setSelectedCountry] = useState("全て");
   const [selectedHandling, setSelectedHandling] = useState<HandlingStatus | "all">("all");
   const [search, setSearch] = useState("");
@@ -270,6 +273,15 @@ export default function ChatsPage() {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="default"
+            size="sm"
+            onClick={() => setBuyerSearchOpen(true)}
+            className="gap-2 rounded-xl"
+          >
+            <MessageSquarePlus size={16} />
+            新規メッセージ
+          </Button>
           <Button
             variant="default"
             size="sm"
@@ -594,6 +606,11 @@ export default function ChatsPage() {
           </div>
         )}
       </div>
+
+      <BuyerSearchDialog
+        open={buyerSearchOpen}
+        onOpenChange={setBuyerSearchOpen}
+      />
     </div>
   );
 }
