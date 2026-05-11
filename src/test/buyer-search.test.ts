@@ -7,8 +7,16 @@ const convProject = vi.fn(() => ({ toArray: convToArray }));
 const convFind = vi.fn(() => ({ project: convProject }));
 const mockConvCollection = { find: convFind };
 
+// shopee_tokens 用 (multi-shop fan-out テストで上書き)
+const tokensToArray = vi.fn(async () => [] as Array<{ shop_id: number }>);
+const tokensProject = vi.fn(() => ({ toArray: tokensToArray }));
+const tokensFind = vi.fn(() => ({ project: tokensProject }));
+const mockTokensCollection = { find: tokensFind };
+
 vi.mock("@/lib/mongodb", () => ({
-  getCollection: vi.fn(async () => mockConvCollection),
+  getCollection: vi.fn(async (name: string) =>
+    name === "shopee_tokens" ? mockTokensCollection : mockConvCollection,
+  ),
 }));
 
 vi.mock("@/lib/shopee-api", () => ({
@@ -23,8 +31,15 @@ vi.mock("@/lib/shopee-token", () => ({
 }));
 
 import { NextRequest } from "next/server";
-import { GET } from "../../app/api/buyers/search/route";
-import { getOrderList, getOrderDetail } from "@/lib/shopee-api";
+import {
+  GET,
+  __clearBuyerSearchCacheForTest,
+} from "../../app/api/buyers/search/route";
+import {
+  getOrderList,
+  getOrderDetail,
+} from "@/lib/shopee-api";
+import { resolveCountryForShop } from "@/lib/shopee-token";
 
 // ===== Fixtures =====
 
@@ -75,6 +90,8 @@ function makeRequest(searchParams: Record<string, string>): NextRequest {
 beforeEach(() => {
   vi.clearAllMocks();
   convToArray.mockResolvedValue([]); // 既存会話なし default
+  tokensToArray.mockResolvedValue([]); // 連携 shop なし default (shop_id 明示テストで使われない)
+  __clearBuyerSearchCacheForTest(); // in-process cache をテスト間で隔離
 });
 
 // ============================================================================
@@ -82,11 +99,13 @@ beforeEach(() => {
 // ============================================================================
 
 describe("/api/buyers/search — validation", () => {
-  it("returns 400 when shop_id is missing", async () => {
+  it("returns 200 with empty buyers when shop_id is missing and no connected shops", async () => {
+    // shop_id 省略時は全 shop 並列検索。 連携 shop ゼロなら空配列。
+    tokensToArray.mockResolvedValueOnce([]);
     const res = await GET(makeRequest({}));
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
     const data = await res.json();
-    expect(data.error).toContain("shop_id");
+    expect(data.buyers).toEqual([]);
   });
 
   it("returns 400 when shop_id is non-numeric", async () => {
@@ -147,6 +166,85 @@ describe("/api/buyers/search — q filter behavior", () => {
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(data.buyers).toEqual([]);
+  });
+});
+
+// ============================================================================
+// Alphanumeric order_sn matching (regression: 26051154AEC7M7 bug)
+// ============================================================================
+
+describe("/api/buyers/search — alphanumeric order_sn matching", () => {
+  beforeEach(() => {
+    (getOrderList as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildListResponse(["26051154AEC7M7", "26052200ZZZ9Q9", "25123199ABCDEF"]),
+    );
+    (getOrderDetail as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildDetailResponse([
+        { order_sn: "26051154AEC7M7", buyer_user_id: 2001, buyer_username: "handofz" },
+        { order_sn: "26052200ZZZ9Q9", buyer_user_id: 2002, buyer_username: "second_buyer" },
+        { order_sn: "25123199ABCDEF", buyer_user_id: 2003, buyer_username: "third_buyer" },
+      ]),
+    );
+  });
+
+  it("hits on full alphanumeric order_sn (26051154AEC7M7)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "26051154AEC7M7" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].order_sn).toBe("26051154AEC7M7");
+  });
+
+  it("hits on order_sn digit-prefix (26051154)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "26051154" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].order_sn).toBe("26051154AEC7M7");
+  });
+
+  it("hits on order_sn alphanumeric suffix (AEC7M7)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "AEC7M7" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].order_sn).toBe("26051154AEC7M7");
+  });
+
+  it("hits on order_sn lower-case (26051154aec7m7)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "26051154aec7m7" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].order_sn).toBe("26051154AEC7M7");
+  });
+
+  it("hits on buyer_username (handofz)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "handofz" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].buyer_username).toBe("handofz");
+  });
+
+  it("hits on uppercase buyer_username (HANDOFZ)", async () => {
+    const res = await GET(
+      makeRequest({ shop_id: String(SHOP_ID), q: "HANDOFZ" }),
+    );
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].buyer_username).toBe("handofz");
   });
 });
 
@@ -224,5 +322,151 @@ describe("/api/buyers/search — window range", () => {
     await GET(makeRequest({ shop_id: String(SHOP_ID), days: "365" }));
     // 90 日 / 15 日 = 6 windows
     expect(getOrderList).toHaveBeenCalledTimes(6);
+  });
+});
+
+// ============================================================================
+// In-process cache (TTL 60s, key = `${shop_id}:${q}:${days}`)
+// ============================================================================
+
+describe("/api/buyers/search — in-process cache", () => {
+  beforeEach(() => {
+    (getOrderList as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildListResponse(["240509AAA"]),
+    );
+    (getOrderDetail as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildDetailResponse([
+        { order_sn: "240509AAA", buyer_user_id: 1001, buyer_username: "cache_buyer" },
+      ]),
+    );
+  });
+
+  it("serves second identical query from cache (no extra Shopee calls)", async () => {
+    const params = { shop_id: String(SHOP_ID), q: "cache_buyer", days: "30" };
+    await GET(makeRequest(params));
+    const callsAfterFirst = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
+
+    // 2 回目: 同一 key → cache 直返し
+    await GET(makeRequest(params));
+    const callsAfterSecond = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(callsAfterSecond).toBe(callsAfterFirst);
+  });
+
+  it("treats different q as separate cache entries", async () => {
+    await GET(makeRequest({ shop_id: String(SHOP_ID), q: "first" }));
+    const after1 = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    await GET(makeRequest({ shop_id: String(SHOP_ID), q: "second" }));
+    const after2 = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(after2).toBeGreaterThan(after1);
+  });
+
+  it("re-fetches after explicit cache clear (simulates TTL expiry)", async () => {
+    const params = { shop_id: String(SHOP_ID), q: "ttl_test" };
+    await GET(makeRequest(params));
+    const after1 = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    __clearBuyerSearchCacheForTest();
+
+    await GET(makeRequest(params));
+    const after2 = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(after2).toBeGreaterThan(after1);
+  });
+});
+
+// ============================================================================
+// Multi-shop fan-out when shop_id is omitted (STEP 4)
+// ============================================================================
+
+describe("/api/buyers/search — multi-shop parallel fan-out", () => {
+  it("queries each connected shop and merges results", async () => {
+    // 連携 shop が 2 つ
+    tokensToArray.mockResolvedValueOnce([
+      { shop_id: 1001 },
+      { shop_id: 1002 },
+    ]);
+    // 各 shop が返す order_sn は別物
+    (getOrderList as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_token: string, shopId: number) => {
+        return buildListResponse([`SN-${shopId}-A`]);
+      },
+    );
+    (getOrderDetail as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_token: string, shopId: number, sns: string[]) => {
+        return buildDetailResponse(
+          sns.map((sn) => ({
+            order_sn: sn,
+            buyer_user_id: shopId,
+            buyer_username: `buyer_${shopId}`,
+          })),
+        );
+      },
+    );
+
+    const res = await GET(makeRequest({}));
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.buyers).toHaveLength(2);
+    const shopIds = data.buyers.map(
+      (b: { shop_id: number }) => b.shop_id,
+    );
+    expect(shopIds).toContain(1001);
+    expect(shopIds).toContain(1002);
+  });
+
+  it("ignores country filter — all connected shops are queried regardless of country", async () => {
+    tokensToArray.mockResolvedValueOnce([
+      { shop_id: 1001 },
+      { shop_id: 1002 },
+    ]);
+    // 各 shop で異なる country を返すよう resolveCountryForShop mock
+    (resolveCountryForShop as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (shopId: number) => (shopId === 1001 ? "SG" : "MY"),
+    );
+    (getOrderList as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildListResponse([]),
+    );
+    (getOrderDetail as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
+      buildDetailResponse([]),
+    );
+
+    await GET(makeRequest({}));
+
+    // 国フィルタは無視 = 両方の shop で getOrderList が呼ばれた
+    const calls = (getOrderList as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    const calledShopIds = new Set(calls.map((c) => c[1])); // 2 番目の引数が shopId
+    expect(calledShopIds.has(1001)).toBe(true);
+    expect(calledShopIds.has(1002)).toBe(true);
+  });
+
+  it("returns partial results when one shop fails", async () => {
+    tokensToArray.mockResolvedValueOnce([
+      { shop_id: 1001 },
+      { shop_id: 1002 },
+    ]);
+    (getOrderList as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_token: string, shopId: number) => {
+        if (shopId === 1001) throw new Error("simulated shop 1001 failure");
+        return buildListResponse([`SN-${shopId}-A`]);
+      },
+    );
+    (getOrderDetail as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_token: string, shopId: number, sns: string[]) => {
+        return buildDetailResponse(
+          sns.map((sn) => ({
+            order_sn: sn,
+            buyer_user_id: shopId,
+            buyer_username: `buyer_${shopId}`,
+          })),
+        );
+      },
+    );
+
+    const res = await GET(makeRequest({}));
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    // shop 1001 は order_list 全 window 失敗 → 0 件、 shop 1002 のみ 1 件
+    expect(data.buyers).toHaveLength(1);
+    expect(data.buyers[0].shop_id).toBe(1002);
   });
 });
