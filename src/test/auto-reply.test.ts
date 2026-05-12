@@ -680,6 +680,184 @@ describe("reviewAutoReplySchedule", () => {
     expect(diffH).toBeGreaterThan(2.5);
     expect(diffH).toBeLessThan(3.5);
   });
+
+  // ===========================================================================
+  // 商品カード問い合わせ救済 (2026-05-11 / gg.ah.goh.goh / shopaholic138)
+  // webhook が fetchAllConversationMessages の空応答で着地したケースを救済する。
+  // ===========================================================================
+
+  // --------------------------------------------------------------------------
+  // Case 9: rawList 空 + last_message_time set + 未返信 → fallback で SCHEDULE
+  // --------------------------------------------------------------------------
+  it("Case 9 (card-leak fix): empty rawList + last_message_time → fallback schedules", async () => {
+    const lmt = hoursAgo(2); // 2h 前 buyer msg、 due = lmt+11h ≈ 9h future
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv_card_leak",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+        last_message_time: new Date(lmt),
+        staff_message_kind_log: [],
+      };
+    });
+
+    await reviewAutoReplySchedule([], SHOP_ID, "conv_card_leak");
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    expect(update.$set.auto_reply_pending).toBe(true);
+    const due = update.$set.auto_reply_due_at as Date;
+    const diffH = (due.getTime() - Date.now()) / 3600_000;
+    expect(diffH).toBeGreaterThan(8.5);
+    expect(diffH).toBeLessThan(9.5);
+  });
+
+  // --------------------------------------------------------------------------
+  // Case 10: rawList 空 + last_auto_reply_at >= last_message_time → 再送防止
+  // --------------------------------------------------------------------------
+  it("Case 10 (card-leak guard): empty rawList + already replied → no schedule", async () => {
+    const lmt = hoursAgo(3);
+    const lar = hoursAgo(2); // 既に auto-reply 済
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv10",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: new Date(lar),
+        last_message_time: new Date(lmt),
+        staff_message_kind_log: [],
+      };
+    });
+
+    await reviewAutoReplySchedule([], SHOP_ID, "conv10");
+
+    // fallback は alreadyReplied で skip、 updateOne は呼ばれない
+    expect(mockCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  // --------------------------------------------------------------------------
+  // Case 11: rawList 空 + staff_message_kind_log にエントリ → 過去スタッフ送信あり
+  // → fallback 適用しない (誤発火回避)
+  // --------------------------------------------------------------------------
+  it("Case 11 (card-leak guard): empty rawList + staff log non-empty → no schedule", async () => {
+    const lmt = hoursAgo(2);
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv11",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+        last_message_time: new Date(lmt),
+        staff_message_kind_log: [{ id: "mid_999", kind: "manual" }],
+      };
+    });
+
+    await reviewAutoReplySchedule([], SHOP_ID, "conv11");
+
+    expect(mockCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  // --------------------------------------------------------------------------
+  // Case 12: rawList 空 + last_message_time も無い → fallback 適用しない (本当に何も無い)
+  // --------------------------------------------------------------------------
+  it("Case 12 (card-leak guard): empty rawList + no last_message_time → no schedule", async () => {
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv12",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+        // last_message_time は未設定
+        staff_message_kind_log: [],
+      };
+    });
+
+    await reviewAutoReplySchedule([], SHOP_ID, "conv12");
+
+    expect(mockCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  // --------------------------------------------------------------------------
+  // Case 13: rawList 非空(buyer messages あり) → 通常パス (fallback 経路を通らない)
+  // --------------------------------------------------------------------------
+  it("Case 13 (card-leak guard regression): non-empty rawList ignores fallback path", async () => {
+    const M = hoursAgo(2);
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv13",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+        last_message_time: new Date(hoursAgo(999)), // intentionally stale to confirm we used rawList not fallback
+        staff_message_kind_log: [],
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, M)],
+      SHOP_ID,
+      "conv13"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    const due = update.$set.auto_reply_due_at as Date;
+    const diffH = (due.getTime() - Date.now()) / 3600_000;
+    // due は M(2h前)+11h ≈ 9h future、 stale last_message_time 由来ではない
+    expect(diffH).toBeGreaterThan(8.5);
+    expect(diffH).toBeLessThan(9.5);
+  });
 });
 
 // ===========================================================================

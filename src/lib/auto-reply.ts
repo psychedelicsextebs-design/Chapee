@@ -278,6 +278,8 @@ export async function reviewAutoReplySchedule(
       auto_reply_pending?: boolean;
       auto_reply_due_at?: Date | null;
       last_auto_reply_at?: Date | null;
+      last_message_time?: Date | null;
+      staff_message_kind_log?: { id: string; kind: string }[];
     }>("shopee_conversations");
 
     const existing = await col.findOne({ conversation_id: convId, shop_id: shopId });
@@ -315,11 +317,51 @@ export async function reviewAutoReplySchedule(
     // Staff detection is NOT just `from_id === shop_id` — Shopee Seller Center
     // sub-account / mobile / CS-agent messages arrive with the staff's personal
     // user_id. Anything that isn't from customer_id is staff-side.
-    const { lastBuyerMs, lastStaffMs } = computeBuyerStaffLastMs(
+    const classified = computeBuyerStaffLastMs(
       rawMessages,
       customerId,
       shopId
     );
+    let lastBuyerMs = classified.lastBuyerMs;
+    const lastStaffMs = classified.lastStaffMs;
+
+    /**
+     * 商品カード問い合わせ救済 (2026-05-11 / gg.ah.goh.goh / shopaholic138 案件):
+     *
+     * webhook が fetchAllConversationMessages の空応答 (Shopee API の race /
+     * 新規会話直後の hiccup) で着地すると rawMessages は length=0 で渡る。
+     * 従来は `lastBuyerMs === 0` で何もせず return していたため、 conv-list 経由で
+     * 同期された last_message_time に対しても auto_reply_pending が立たず Overdue
+     * 警告に至っていた。
+     *
+     * 安全ガード (誤発火回避):
+     *   - rawMessages.length === 0 (Shopee fetch がまるごと空) 限定
+     *   - existing.last_message_time が存在 (conv-list sync で埋まっている)
+     *   - last_auto_reply_at が無い or < last_message_time (再送防止)
+     *   - staff_message_kind_log が空 (我々のシステムから何も送っていない)
+     *
+     * 後段の pre-send guard が再度 rawList を取得して buyer/staff を検証するため、
+     * Shopee API が回復したタイミングで staff の後追いが検知されればキャンセルされる。
+     * Shopee が引き続き空を返す場合は pre-send 側のフォールバックで pending を温存。
+     */
+    if (
+      lastBuyerMs === 0 &&
+      rawMessages.length === 0 &&
+      existing.last_message_time instanceof Date
+    ) {
+      const lmt = existing.last_message_time;
+      const lar = existing.last_auto_reply_at;
+      const staffLog = existing.staff_message_kind_log ?? [];
+      const alreadyReplied =
+        lar instanceof Date && lar.getTime() >= lmt.getTime();
+      if (!alreadyReplied && staffLog.length === 0) {
+        lastBuyerMs = lmt.getTime();
+        console.log(
+          `[auto-reply] review: empty rawList fallback (using last_message_time) ` +
+            `conv=${convId} shop=${shopId} lmt=${lmt.toISOString()}`
+        );
+      }
+    }
 
     if (lastBuyerMs === 0) {
       // No buyer activity at all → nothing to auto-reply to.
@@ -576,7 +618,23 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
      * review ロジックに将来バグが入っても誤送信が発生しないよう、ここで独立に
      * 「最新メッセージが buyer からの送信であること」を直接検査する。
      * buyer ではない（= スタッフ側からの送信）なら送らずキャンセル。
+     *
+     * 商品カード問い合わせ救済 (2026-05-11): rawList が完全に空 (Shopee fetch
+     * hiccup) なら、 buyer/staff いずれも確証できない → pending を温存して
+     * 次回 cron に retry させる。 schedule 側のフォールバックで pending は
+     * conv-list の last_message_time から立っているため、 Shopee 側が回復した
+     * 時点で buyer / staff のどちらかに確定し、 正しくキャンセル or 発火する。
+     * 誤発火 (送ってはいけないものを送る) はゼロのまま、 漏れだけ減らす。
      */
+    if (rawList.length === 0) {
+      console.log(
+        `[auto-reply] pre-send: empty rawList, preserving pending for retry ` +
+          `conv=${convId} shop=${shopId}`
+      );
+      result.skipped++;
+      continue;
+    }
+
     const { lastBuyerMs: guardBuyerMs, lastStaffMs: guardStaffMs } =
       computeBuyerStaffLastMs(rawList, customerIdNum, shopId);
     if (guardBuyerMs === 0 || guardStaffMs >= guardBuyerMs) {
