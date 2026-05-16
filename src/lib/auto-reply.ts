@@ -507,7 +507,114 @@ export type ProcessAutoReplyResult = {
   errors: { conversation_id: string; error: string }[];
 };
 
+export type RescueAutoReplyResult = {
+  scanned: number;
+  rescued: number;
+  skipped: number;
+};
+
 const MAX_BATCH = 30;
+const RESCUE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const RESCUE_MAX_BATCH = 100;
+
+/**
+ * フラグに依存しない救済スキャン (auto-reply 漏れ防止セーフティネット)。
+ *
+ * 通常は webhook (handleAutoReplyOnWebhookMessage) / sync (scheduleAutoReplyForUnread) /
+ * chats-messages の review が `auto_reply_pending=true` をセットするが、 3 経路が
+ * 何らかの理由で空振りすると DB に処理対象が存在せず cron は永遠に空回りする
+ * (2026-05-15 観察 — pending_total=0 で cron が processed=0 を返し続ける状態)。
+ *
+ * 本スキャンは最後の砦として直近 24h の buyer 着信を網羅的に拾い、 staff 応答
+ * 等の検証は processDueAutoReplies の pre-send guard (Shopee API 経由の
+ * staff 応答確認 + Patch C cooldown) に委ねる。 mutation は最小限
+ * (auto_reply_pending と auto_reply_due_at のみ)。
+ *
+ * 副作用 (いずれも誤発火を生まない):
+ *   - staff が手動返信済みでも DB の last_auto_reply_at が未更新なら一旦
+ *     pending=true になる → pre-send guard で staff 応答が検知され
+ *     clearAutoReplySchedule される。
+ *   - last_message_time が staff 由来 (sticker 等で bump) でも一旦 pending →
+ *     同じく pre-send guard で取消し。
+ */
+export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResult> {
+  const result: RescueAutoReplyResult = { scanned: 0, rescued: 0, skipped: 0 };
+
+  const col = await getCollection<{
+    conversation_id: string;
+    shop_id: number;
+    country?: string;
+    customer_id?: number;
+    chat_type?: string;
+    last_message_time?: Date | null;
+    last_auto_reply_at?: Date | null;
+    auto_reply_pending?: boolean;
+  }>("shopee_conversations");
+
+  const countries = await getSingletonAutoReplyCountries();
+  const cutoff = new Date(Date.now() - RESCUE_LOOKBACK_MS);
+
+  const candidates = await col
+    .find({
+      chat_type: { $ne: "notification" },
+      customer_id: { $gt: 0 },
+      last_message_time: { $gte: cutoff },
+      auto_reply_pending: { $ne: true },
+      $or: [
+        { last_auto_reply_at: { $exists: false } },
+        { last_auto_reply_at: null },
+        { $expr: { $lt: ["$last_auto_reply_at", "$last_message_time"] } },
+      ],
+    })
+    .limit(RESCUE_MAX_BATCH)
+    .toArray();
+
+  for (const doc of candidates) {
+    result.scanned++;
+
+    const lmt = doc.last_message_time;
+    if (!(lmt instanceof Date)) {
+      result.skipped++;
+      continue;
+    }
+
+    const country = (await getShopCountry(doc.shop_id)) ?? doc.country ?? "SG";
+    const countryKey = String(country).toUpperCase();
+    const cfg = countries[countryKey];
+    if (
+      !cfg?.enabled ||
+      !cfg.template_id?.trim() ||
+      !ObjectId.isValid(cfg.template_id.trim())
+    ) {
+      result.skipped++;
+      continue;
+    }
+
+    const triggerHour = Math.max(1, Number(cfg.triggerHour) || 1);
+    const dueMs = lmt.getTime() + triggerHour * 60 * 60 * 1000;
+    const nowMs = Date.now();
+    const due = new Date(dueMs > nowMs ? dueMs : nowMs);
+
+    await col.updateOne(
+      { conversation_id: doc.conversation_id, shop_id: doc.shop_id },
+      {
+        $set: {
+          auto_reply_pending: true,
+          auto_reply_due_at: due,
+          updated_at: new Date(),
+        },
+      }
+    );
+
+    result.rescued++;
+    console.log(
+      `[auto-reply] rescue: flagged conv=${doc.conversation_id} shop=${doc.shop_id} ` +
+        `lmt=${lmt.toISOString()} due=${due.toISOString()}`
+    );
+  }
+
+  return result;
+}
 
 /**
  * 期限到来の会話にテンプレートを送信（cron 用）
