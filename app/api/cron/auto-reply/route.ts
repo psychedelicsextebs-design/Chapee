@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { processDueAutoReplies } from "@/lib/auto-reply";
+import {
+  processDueAutoReplies,
+  rescueUnflaggedAutoReplies,
+} from "@/lib/auto-reply";
 
 /**
  * GET /api/cron/auto-reply
@@ -22,11 +25,19 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    // フラグ立ての 3 経路 (webhook / sync / chats-messages review) が空振りした
+    // 場合の最後の砦。 直近 24h の buyer 着信を網羅的に拾って pending=true を
+    // 立てるだけで、 staff 応答などの検証は processDueAutoReplies の pre-send
+    // guard に委ねる (誤発火ゼロを維持)。
+    const rescue = await rescueUnflaggedAutoReplies();
+    console.log("[cron/auto-reply] rescue", rescue);
+
     const results = await processDueAutoReplies();
-    console.log("[cron/auto-reply]", results);
+    console.log("[cron/auto-reply] process", results);
 
     return NextResponse.json({
       success: true,
+      rescue,
       ...results,
     });
   } catch (error) {
