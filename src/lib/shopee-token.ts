@@ -2,6 +2,17 @@ import { getCollection } from "@/lib/mongodb";
 import { refreshAccessToken } from "./shopee-api";
 
 /**
+ * Shopee access_token の TTL は約 4 時間 (14,400 秒)。 Vercel cron は 15 分
+ * 間隔で /api/cron/auto-reply を叩く ([vercel.json](../../vercel.json)) ため、
+ * cron 2 tick 分の余裕を残して 30 分前に refresh する。
+ *
+ * 旧値は 24h で、 これだと毎回の cron で必ず refresh が走り Shopee API を
+ * 浪費していた (2026-05-18 観察 — auto-reply cron で 5 件処理に対し
+ * 12 秒以上を refresh ループが消費)。
+ */
+const REFRESH_BUFFER_MS = 30 * 60 * 1000;
+
+/**
  * Get valid access token for a shop, refreshing if needed
  */
 export async function getValidToken(shopId: number): Promise<string> {
@@ -29,13 +40,11 @@ export async function getValidToken(shopId: number): Promise<string> {
   console.log(`[Token] Expires at: ${token.expires_at}`);
   console.log(`[Token] Current time: ${new Date()}`);
 
-  // Check if token expires in next 24 hours
   const expiresIn = token.expires_at.getTime() - Date.now();
-  const oneDayMs = 24 * 60 * 60 * 1000;
 
   console.log(`[Token] Expires in: ${Math.floor(expiresIn / 1000 / 60)} minutes`);
 
-  if (expiresIn < oneDayMs) {
+  if (expiresIn < REFRESH_BUFFER_MS) {
     console.log(`[Token] Token expiring soon, refreshing for shop ${shopId}...`);
     
     // Refresh token
@@ -109,15 +118,14 @@ export async function resolveCountryForShop(
  */
 export async function refreshAllExpiringTokens() {
   const shops = await getConnectedShops();
-  const oneDayMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
 
   const results = [];
 
   for (const shop of shops) {
     const expiresIn = shop.expires_at.getTime() - now;
-    
-    if (expiresIn < oneDayMs) {
+
+    if (expiresIn < REFRESH_BUFFER_MS) {
       try {
         await getValidToken(shop.shop_id);
         results.push({ shop_id: shop.shop_id, status: "refreshed" });

@@ -711,11 +711,29 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       shop_id: shopId,
     });
     const nowSend = new Date();
-    if (
-      !afterReview?.auto_reply_pending ||
-      !(afterReview.auto_reply_due_at instanceof Date) ||
-      afterReview.auto_reply_due_at.getTime() > nowSend.getTime()
-    ) {
+    if (!afterReview?.auto_reply_pending) {
+      console.log(
+        `[auto-reply] pre-send: skipped (post-review pending=false) ` +
+          `conv=${convId} shop=${shopId}`
+      );
+      result.skipped++;
+      continue;
+    }
+    if (!(afterReview.auto_reply_due_at instanceof Date)) {
+      console.log(
+        `[auto-reply] pre-send: skipped (post-review due_at missing) ` +
+          `conv=${convId} shop=${shopId}`
+      );
+      result.skipped++;
+      continue;
+    }
+    if (afterReview.auto_reply_due_at.getTime() > nowSend.getTime()) {
+      console.log(
+        `[auto-reply] pre-send: skipped (post-review due_at rescheduled to future) ` +
+          `conv=${convId} shop=${shopId} ` +
+          `due=${afterReview.auto_reply_due_at.toISOString()} ` +
+          `now=${nowSend.toISOString()}`
+      );
       result.skipped++;
       continue;
     }
@@ -799,6 +817,10 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     );
 
     if (!claimed) {
+      console.log(
+        `[auto-reply] pre-send: skipped (claim race — another worker took it) ` +
+          `conv=${convId} shop=${shopId}`
+      );
       result.skipped++;
       continue;
     }
@@ -806,18 +828,33 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     try {
       const cfg = countries[countryKey];
       if (!cfg?.enabled || !cfg.template_id?.trim()) {
+        console.log(
+          `[auto-reply] pre-send: skipped (cfg disabled or template_id empty) ` +
+            `conv=${convId} shop=${shopId} country=${countryKey} ` +
+            `enabled=${cfg?.enabled ?? "undef"} ` +
+            `template_id=${cfg?.template_id?.trim() ? "set" : "empty"}`
+        );
         result.skipped++;
         continue;
       }
 
       const content = await resolveTemplateContent(cfg.template_id);
       if (!content) {
+        console.log(
+          `[auto-reply] pre-send: skipped (template content empty/missing) ` +
+            `conv=${convId} shop=${shopId} country=${countryKey} ` +
+            `template_id=${cfg.template_id}`
+        );
         result.skipped++;
         continue;
       }
 
       const buyerId = Number(doc.customer_id);
       if (!Number.isFinite(buyerId) || buyerId <= 0) {
+        console.log(
+          `[auto-reply] pre-send: skipped (buyerId invalid post-claim) ` +
+            `conv=${convId} shop=${shopId} customer_id=${doc.customer_id}`
+        );
         result.skipped++;
         continue;
       }
