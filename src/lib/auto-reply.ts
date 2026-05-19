@@ -556,6 +556,58 @@ const RESCUE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const RESCUE_MAX_BATCH = 100;
 
 /**
+ * 一回限りの緊急テンプレID修正 (2026-05-19 / template content empty/missing 復旧)。
+ *
+ * 「テンプレ削除/編集のたびに auto_reply_settings の template_id が orphan に
+ * なる」構造欠陥を、レイヤー 3 の resolveTemplateContent fallback で耐性付与
+ * したのに加え、 既存の壊れた template_id 自体も復元するための one-shot 処理。
+ *
+ * 動作:
+ *   - auto_reply_settings.template_fix_applied が true なら no-op (idempotent)
+ *   - false / 未設定なら全カ国 template_id を営業時間外テンプレ
+ *     (69fd937436d074c27df37548) に強制統一し、 template_fix_applied: true を立てる
+ *
+ * 次回 cron 以降は冒頭で早期 return するため、 本コードを残したまま放置しても
+ * パフォーマンス影響はほぼゼロ (findOne 1 回)。 落ち着いたら別 commit で削除予定。
+ */
+const TEMPLATE_FIX_TARGET_ID = "69fd937436d074c27df37548";
+
+async function applyOneShotTemplateFix(): Promise<void> {
+  try {
+    const col = await getCollection<{
+      _id: string;
+      countries?: Record<string, AutoReplyCountryCfg>;
+      template_fix_applied?: boolean;
+      updated_at?: Date;
+    }>("auto_reply_settings");
+
+    const doc = await col.findOne({ _id: "singleton" });
+    if (!doc) return;
+    if (doc.template_fix_applied === true) return;
+
+    const countries = doc.countries ?? {};
+    const countriesUpdated = Object.keys(countries);
+
+    const $set: Record<string, unknown> = {
+      template_fix_applied: true,
+      updated_at: new Date(),
+    };
+    for (const country of countriesUpdated) {
+      $set[`countries.${country}.template_id`] = TEMPLATE_FIX_TARGET_ID;
+    }
+
+    await col.updateOne({ _id: "singleton" }, { $set });
+
+    console.log(
+      `[auto-reply] template_fix: applied target=${TEMPLATE_FIX_TARGET_ID} ` +
+        `countries=${JSON.stringify(countriesUpdated)}`
+    );
+  } catch (e) {
+    console.error("[auto-reply] template_fix: failed (non-fatal)", e);
+  }
+}
+
+/**
  * フラグに依存しない救済スキャン (auto-reply 漏れ防止セーフティネット)。
  *
  * 通常は webhook (handleAutoReplyOnWebhookMessage) / sync (scheduleAutoReplyForUnread) /
@@ -658,6 +710,9 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
  * 期限到来の会話にテンプレートを送信（cron 用）
  */
 export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
+  // one-shot 緊急テンプレID修正 (2026-05-19)。 idempotent; 適用済みなら即 return。
+  await applyOneShotTemplateFix();
+
   const result: ProcessAutoReplyResult = {
     processed: 0,
     sent: 0,

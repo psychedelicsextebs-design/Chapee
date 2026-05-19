@@ -3,7 +3,6 @@ import {
   processDueAutoReplies,
   rescueUnflaggedAutoReplies,
 } from "@/lib/auto-reply";
-import { logTemplateResolveDiag } from "@/lib/diag-template-resolve";
 
 /**
  * GET /api/cron/auto-reply
@@ -25,13 +24,6 @@ export async function GET(request: NextRequest) {
     if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-
-    // [TEMP 2026-05-18] auto-reply skipped:* の真因 (template content
-    // empty/missing) を Vercel Logs から特定するため、 cron 冒頭で
-    // auto_reply_settings + reply_templates を read-only でダンプする。
-    // 真因確定後に diag-template-resolve helper と一緒に削除する想定。
-    // mutation ゼロ / auto-reply ロジックの結果には影響しない。
-    await logTemplateResolveDiag("cron");
 
     // フラグ立ての 3 経路 (webhook / sync / chats-messages review) が空振りした
     // 場合の最後の砦。 直近 24h の buyer 着信を網羅的に拾って pending=true を
