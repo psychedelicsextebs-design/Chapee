@@ -318,6 +318,7 @@ export async function reviewAutoReplySchedule(
       last_auto_reply_at?: Date | null;
       last_message_time?: Date | null;
       staff_message_kind_log?: { id: string; kind: string }[];
+      rescue_at?: Date | null;
     }>("shopee_conversations");
 
     const existing = await col.findOne({ conversation_id: convId, shop_id: shopId });
@@ -364,27 +365,33 @@ export async function reviewAutoReplySchedule(
     const lastStaffMs = classified.lastStaffMs;
 
     /**
-     * 商品カード問い合わせ救済 (2026-05-11 / gg.ah.goh.goh / shopaholic138 案件):
+     * 商品カード問い合わせ救済 (2026-05-11 / gg.ah.goh.goh / shopaholic138 案件)
+     * + rescue 経由 pending の silent-clear 抑止 (2026-05-19 / 拡張):
      *
-     * webhook が fetchAllConversationMessages の空応答 (Shopee API の race /
-     * 新規会話直後の hiccup) で着地すると rawMessages は length=0 で渡る。
-     * 従来は `lastBuyerMs === 0` で何もせず return していたため、 conv-list 経由で
-     * 同期された last_message_time に対しても auto_reply_pending が立たず Overdue
-     * 警告に至っていた。
+     * 元々は webhook が空応答 (Shopee API の race / 新規会話直後の hiccup) で
+     * 着地して rawMessages.length===0 になったケースの救済だった。
      *
-     * 安全ガード (誤発火回避):
-     *   - rawMessages.length === 0 (Shopee fetch がまるごと空) 限定
+     * 2026-05-19 拡張: rawMessages が非空でも classifyShopeeMessageSender が
+     * buyer/staff いずれも特定できない (lastBuyerMs===0 かつ lastStaffMs===0)
+     * ケースを同じ経路に流す。 これは rescue scan が `last_message_time` で
+     * pending を立てた直後、 review() がここで silent に pending=false に
+     * 戻して全件 skipped になっていた症状 (Vercel Logs 2026-05-19 01:45 tick)
+     * の根本対処。 system message / unknown sticker しか分類できない場合の
+     * 「とりあえず last_message_time を buyer 時刻として採用」フォールバック。
+     *
+     * 安全ガード (誤発火回避、 staff 応答が見えた場合は適用しない):
+     *   - lastStaffMs === 0 (= rawList から staff 信号がゼロ。 1 件でも staff
+     *     が検出されれば後段の lastStaffMs >= lastBuyerMs で正しくキャンセルされる)
      *   - existing.last_message_time が存在 (conv-list sync で埋まっている)
      *   - last_auto_reply_at が無い or < last_message_time (再送防止)
      *   - staff_message_kind_log が空 (我々のシステムから何も送っていない)
      *
-     * 後段の pre-send guard が再度 rawList を取得して buyer/staff を検証するため、
-     * Shopee API が回復したタイミングで staff の後追いが検知されればキャンセルされる。
-     * Shopee が引き続き空を返す場合は pre-send 側のフォールバックで pending を温存。
+     * 後段の pre-send guard も同じ拡張を持っているので、 Shopee API が staff
+     * メッセージを返したタイミングで自動キャンセルされる。
      */
     if (
       lastBuyerMs === 0 &&
-      rawMessages.length === 0 &&
+      lastStaffMs === 0 &&
       existing.last_message_time instanceof Date
     ) {
       const lmt = existing.last_message_time;
@@ -395,8 +402,10 @@ export async function reviewAutoReplySchedule(
       if (!alreadyReplied && staffLog.length === 0) {
         lastBuyerMs = lmt.getTime();
         console.log(
-          `[auto-reply] review: empty rawList fallback (using last_message_time) ` +
-            `conv=${convId} shop=${shopId} lmt=${lmt.toISOString()}`
+          `[auto-reply] review: no-signal fallback (using last_message_time) ` +
+            `conv=${convId} shop=${shopId} ` +
+            `rawListLen=${rawMessages.length} ` +
+            `lmt=${lmt.toISOString()}`
         );
       }
     }
@@ -404,7 +413,18 @@ export async function reviewAutoReplySchedule(
     if (lastBuyerMs === 0) {
       // No buyer activity at all → nothing to auto-reply to.
       if (existing.auto_reply_pending) {
+        const staffLogLen = (existing.staff_message_kind_log ?? []).length;
         await clearAutoReplySchedule(convId, shopId);
+        console.log(
+          `[auto-reply] review: cleared (no buyer activity in rawList) ` +
+            `conv=${convId} shop=${shopId} ` +
+            `rawListLen=${rawMessages.length} ` +
+            `lastStaffMs=${lastStaffMs} ` +
+            `lmt=${existing.last_message_time?.toISOString?.() ?? "none"} ` +
+            `lar=${existing.last_auto_reply_at?.toISOString?.() ?? "none"} ` +
+            `staffLog=${staffLogLen} ` +
+            `rescue_at=${existing.rescue_at?.toISOString?.() ?? "none"}`
+        );
       }
       return;
     }
@@ -413,7 +433,12 @@ export async function reviewAutoReplySchedule(
     if (lastStaffMs >= lastBuyerMs) {
       if (existing.auto_reply_pending) {
         await clearAutoReplySchedule(convId, shopId);
-        console.log(`[auto-reply] review: cleared (staff replied) conv=${convId}`);
+        console.log(
+          `[auto-reply] review: cleared (staff replied) conv=${convId} ` +
+            `lastBuyer=${new Date(lastBuyerMs).toISOString()} ` +
+            `lastStaff=${new Date(lastStaffMs).toISOString()} ` +
+            `rescue_at=${existing.rescue_at?.toISOString?.() ?? "none"}`
+        );
       }
       return;
     }
@@ -691,6 +716,7 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
         $set: {
           auto_reply_pending: true,
           auto_reply_due_at: due,
+          rescue_at: new Date(),
           updated_at: new Date(),
         },
       }
@@ -713,6 +739,32 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
   // one-shot 緊急テンプレID修正 (2026-05-19)。 idempotent; 適用済みなら即 return。
   await applyOneShotTemplateFix();
 
+  // [TEMP DIAG 2026-05-19] one-shot fix と template_id の現状確認。
+  // 真因確定後に削除する。
+  try {
+    const settingsCol = await getCollection<{
+      _id: string;
+      countries?: Record<string, AutoReplyCountryCfg>;
+      template_fix_applied?: boolean;
+      updated_at?: Date;
+    }>("auto_reply_settings");
+    const settingsDoc = await settingsCol.findOne({ _id: "singleton" });
+    console.log(
+      "[auto-reply] settings-dump",
+      JSON.stringify(
+        {
+          template_fix_applied: settingsDoc?.template_fix_applied ?? null,
+          countries: settingsDoc?.countries ?? null,
+          updated_at: settingsDoc?.updated_at ?? null,
+        },
+        null,
+        2
+      )
+    );
+  } catch (e) {
+    console.error("[auto-reply] settings-dump failed (non-fatal)", e);
+  }
+
   const result: ProcessAutoReplyResult = {
     processed: 0,
     sent: 0,
@@ -729,6 +781,9 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     auto_reply_due_at?: Date | null;
     last_auto_reply_at?: Date | null;
     chat_type?: string;
+    last_message_time?: Date | null;
+    staff_message_kind_log?: { id: string; kind: string }[];
+    rescue_at?: Date | null;
   }>("shopee_conversations");
 
   const now = new Date();
@@ -855,10 +910,46 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
 
     const { lastBuyerMs: guardBuyerMs, lastStaffMs: guardStaffMs } =
       computeBuyerStaffLastMs(rawList, customerIdNum, shopId);
-    if (guardBuyerMs === 0 || guardStaffMs >= guardBuyerMs) {
+
+    /**
+     * no-signal fallback (2026-05-19): rawList が非空でも classifyShopeeMessageSender が
+     * buyer/staff いずれも分類できないケースで、 review() と同じ条件で last_message_time を
+     * buyer 時刻として採用する。 review() の同様 fallback で pending=true のまま到達した
+     * conversation が、ここで silent に再キャンセルされないようにする (2026-05-19 01:45 tick
+     * の「全件 post-review pending=false 直後の pre-send guard cancel」症状対策)。
+     *
+     * 安全側: guardStaffMs > 0 なら staff 信号が見えているので適用しない (= 後段ガードで
+     * 通常通りキャンセル)。 staff_message_kind_log 非空 / alreadyReplied も適用外。
+     */
+    let effectiveBuyerMs = guardBuyerMs;
+    if (guardBuyerMs === 0 && guardStaffMs === 0) {
+      const lmt = afterReview.last_message_time;
+      const lar = afterReview.last_auto_reply_at;
+      const staffLog = afterReview.staff_message_kind_log ?? [];
+      const alreadyReplied =
+        lar instanceof Date && lmt instanceof Date && lar.getTime() >= lmt.getTime();
+      if (lmt instanceof Date && !alreadyReplied && staffLog.length === 0) {
+        effectiveBuyerMs = lmt.getTime();
+        console.log(
+          `[auto-reply] pre-send guard: no-signal fallback (using last_message_time) ` +
+            `conv=${convId} shop=${shopId} ` +
+            `rawListLen=${rawList.length} ` +
+            `lmt=${lmt.toISOString()} ` +
+            `rescue_at=${afterReview.rescue_at?.toISOString?.() ?? "none"}`
+        );
+      }
+    }
+
+    if (effectiveBuyerMs === 0 || guardStaffMs >= effectiveBuyerMs) {
+      const staffLogLen = (afterReview.staff_message_kind_log ?? []).length;
       await clearAutoReplySchedule(convId, shopId);
       console.log(
-        `[auto-reply] pre-send guard: cancelled (latest is staff or no buyer msg) conv=${convId} shop=${shopId}`
+        `[auto-reply] pre-send guard: cancelled (latest is staff or no buyer msg) ` +
+          `conv=${convId} shop=${shopId} ` +
+          `guardBuyerMs=${guardBuyerMs} guardStaffMs=${guardStaffMs} ` +
+          `effectiveBuyerMs=${effectiveBuyerMs} ` +
+          `staffLog=${staffLogLen} ` +
+          `rescue_at=${afterReview.rescue_at?.toISOString?.() ?? "none"}`
       );
       result.skipped++;
       continue;
@@ -878,15 +969,19 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
      *
      * 副作用: 真の system card (from_id=0 to_id=0) が buyer の後に挟まると
      * 不必要にスキップする可能性がある。だが「誤送信 > 送信漏れ」の方針に沿う。
+     *
+     * no-signal fallback (2026-05-19) と組み合わせる時は effectiveBuyerMs を基準にする。
+     * fallback で last_message_time を採用した場合でも、 rawList に新しい未分類活動が
+     * あれば Patch C で再度シャットダウンされるため誤発火しない。
      */
     const lastAnyMs = computeLastAnyMessageMs(rawList);
-    if (lastAnyMs > guardBuyerMs) {
+    if (lastAnyMs > effectiveBuyerMs) {
       await clearAutoReplySchedule(convId, shopId);
       console.log(
         `[auto-reply] pre-send guard (Patch C): cancelled (unclassified activity after lastBuyer) ` +
           `conv=${convId} shop=${shopId} ` +
           `lastAny=${new Date(lastAnyMs).toISOString()} ` +
-          `lastBuyer=${new Date(guardBuyerMs).toISOString()}`
+          `effectiveBuyer=${new Date(effectiveBuyerMs).toISOString()}`
       );
       result.skipped++;
       continue;
