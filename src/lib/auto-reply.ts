@@ -134,14 +134,52 @@ async function getSingletonAutoReplyCountries(): Promise<
   return doc?.countries ?? {};
 }
 
-async function resolveTemplateContent(templateId: string): Promise<string | null> {
-  if (!templateId || !ObjectId.isValid(templateId)) return null;
-  const col = await getCollection<{ _id: ObjectId; content: string }>(
-    "reply_templates"
-  );
-  const doc = await col.findOne({ _id: new ObjectId(templateId) });
-  const text = doc?.content?.trim();
-  return text || null;
+/**
+ * テンプレ ID で本文を解決する。 ID が壊れている / テンプレが削除済み /
+ * content が空、のいずれでも auto-reply を止めないよう、 autoReply=true で
+ * 最新の updated_at を持つテンプレに自動 fallback する (レイヤー 3 防御)。
+ *
+ * 設計欠陥対応 (2026-05-19): UI からテンプレを編集・削除しても
+ * auto_reply_settings は古い template_id を参照し続けるため、 ID 不整合の
+ * たびに「template content empty/missing」で本番 auto-reply が skipped になる
+ * 問題への耐性層。 fallback 発火時は console.warn で監視可能にする。
+ *
+ * 呼び出し側 (processDueAutoReplies) は cfg.enabled と cfg.template_id 非空を
+ * 既にガードしているため、 fallback が「設定されていないのに勝手に送る」状況
+ * にはならない。
+ */
+async function resolveTemplateContent(
+  templateId: string
+): Promise<string | null> {
+  const col = await getCollection<{
+    _id: ObjectId;
+    content?: string;
+    autoReply?: boolean;
+    name?: string;
+    updated_at?: Date;
+  }>("reply_templates");
+
+  if (templateId && ObjectId.isValid(templateId)) {
+    const doc = await col.findOne({ _id: new ObjectId(templateId) });
+    const text = doc?.content?.trim();
+    if (text) return text;
+  }
+
+  const fb = await col
+    .find({ autoReply: true })
+    .sort({ updated_at: -1 })
+    .limit(1)
+    .next();
+  const fbText = fb?.content?.trim();
+  if (fbText && fb) {
+    console.warn(
+      `[auto-reply] resolveTemplateContent: fallback to autoReply=true template ` +
+        `id=${fb._id.toHexString()} name=${fb.name ?? "?"} ` +
+        `(requested template_id=${templateId || "(empty)"})`
+    );
+    return fbText;
+  }
+  return null;
 }
 
 /**
