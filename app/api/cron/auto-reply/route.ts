@@ -3,6 +3,7 @@ import {
   processDueAutoReplies,
   rescueUnflaggedAutoReplies,
 } from "@/lib/auto-reply";
+import { logAutoReplyPipelineDiag } from "@/lib/diag-auto-reply-pipeline";
 
 /**
  * GET /api/cron/auto-reply
@@ -24,6 +25,12 @@ export async function GET(request: NextRequest) {
     if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+
+    // [TEMP DIAG 2026-05-21] sent:0 / rescue scanned:0 の真因確定用。
+    // rescue が pending を立てる前の「素の状態」を撮るため、 必ず rescue より先に実行する
+    // (rescue_query.count == rescue が実際に scan する件数 になるよう順序を固定)。
+    // 真因確定後に diag-auto-reply-pipeline 一式と共に削除する。
+    await logAutoReplyPipelineDiag("cron");
 
     // フラグ立ての 3 経路 (webhook / sync / chats-messages review) が空振りした
     // 場合の最後の砦。 直近 24h の buyer 着信を網羅的に拾って pending=true を
