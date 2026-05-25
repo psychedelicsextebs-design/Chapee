@@ -591,9 +591,8 @@ export default function DashboardPage() {
             style={{ animationDelay: `${index * 50}ms` }}
             onClick={() => {
               if (label === "Shopee通知") {
-                // 本物の Seller Center 通知は会話一覧ではなく 🔔 に出る。
-                // ?focus=notifications で HeaderNotificationCenter のベルを開く。
-                router.push("/dashboard?focus=notifications");
+                // 本物の Seller Center 通知の専用ページへ遷移（国別/カテゴリ絞り込み）
+                router.push("/notifications");
                 return;
               }
               if (label === "未読メッセージ") {

@@ -17,6 +17,54 @@ export type ShopCenterNotifItem = {
   country?: string;
 };
 
+/**
+ * Shopee 通知のカテゴリ。
+ * get_shop_notification はカテゴリを返さないため、タイトル/本文から推定する。
+ * （Seller Center Web UI の Order/Rating/Return&Refund 等に相当）
+ */
+export type ShopNotifCategory =
+  | "order"
+  | "rating"
+  | "return_refund"
+  | "performance"
+  | "balance"
+  | "listing"
+  | "other";
+
+export const SHOP_NOTIF_CATEGORY_LABELS: Record<ShopNotifCategory, string> = {
+  order: "注文",
+  rating: "評価",
+  return_refund: "返品・返金",
+  performance: "パフォーマンス",
+  balance: "残高・入金",
+  listing: "出品",
+  other: "その他",
+};
+
+/**
+ * 通知のカテゴリをタイトル優先で推定する（本文はフォールバック）。
+ * 判定順は重要: 「Order completed... rate the buyer」のような複合文でも
+ * タイトル基準（"Order completed"→order, "Rate Buyer"→rating）で正しく振り分ける。
+ */
+export function inferShopNotificationCategory(item: {
+  title?: string;
+  content?: string;
+}): ShopNotifCategory {
+  const classify = (raw: string): ShopNotifCategory | null => {
+    const s = raw.toLowerCase();
+    if (!s.trim()) return null;
+    if (/refund|return/.test(s)) return "return_refund";
+    if (/\brate\b|rating|review/.test(s)) return "rating";
+    if (/performance|penalty|violation|non[- ]?fulfil/.test(s)) return "performance";
+    if (/payment|payout|transfer|balance|wallet|disburse|income/.test(s))
+      return "balance";
+    if (/order|ship|deliver|parcel|cancel/.test(s)) return "order";
+    if (/listing|product|stock/.test(s)) return "listing";
+    return null;
+  };
+  return classify(item.title ?? "") ?? classify(item.content ?? "") ?? "other";
+}
+
 /** Shopee が同一 notification_id を複数返すことがあるため、先勝ちで一意化（店舗またぎは shopId を含める） */
 export function dedupeShopNotificationItems(
   items: ShopCenterNotifItem[]

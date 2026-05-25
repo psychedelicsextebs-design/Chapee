@@ -192,7 +192,7 @@ export function extractShopLogoFromShopInfo(data: Record<string, unknown>): stri
  *
  * 「Shopee の通知」として本当に見たいもの（Parcel Delivered / Order Cancelled /
  * Payment Transfer 等の Seller Center 通知）は会話一覧ではなく
- * get_shop_notification（🔔 HeaderNotificationCenter）から来る別系統。
+ * get_shop_notification（/notifications ページ）から来る別系統。
  *
  * 会話一覧側で notification 扱いするのは「相手が Shopee 通知アカウント」の場合のみ。
  * 以前は return_refund_card / out_of_stock_reminder_card / faq_liveagent_prompt を

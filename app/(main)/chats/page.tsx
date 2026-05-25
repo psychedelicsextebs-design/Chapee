@@ -171,8 +171,8 @@ export default function ChatsPage() {
     // 同時に複数の loadChats が走った場合、最後に開始したものだけが setChats する
     // （手動更新と初回ロードが競合したときの後着上書きを防ぐ）。
     const seq = ++loadSeqRef.current;
-    // 全会話を取得する。Shopee の Seller Center 通知は会話ではなく 🔔
-    // (HeaderNotificationCenter) に出るため、ここで chat_type で除外しない。
+    // 全会話を取得する。Shopee の Seller Center 通知は会話ではなく
+    // /notifications ページ (get_shop_notification) に出るため、chat_type で除外しない。
     const res = await fetch("/api/chats");
     if (!res.ok) throw new Error("Failed to load chats");
     const data = await res.json();

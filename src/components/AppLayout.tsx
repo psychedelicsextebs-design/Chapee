@@ -11,6 +11,7 @@ import {
   FileText,
   Zap,
   Bell,
+  BellRing,
   Users,
   LogOut,
   Menu,
@@ -26,7 +27,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import HeaderNotificationCenter from "@/components/HeaderNotificationCenter";
 
 // Project assets from /public
 const APP_ICON = "/icon.png";
@@ -35,6 +35,7 @@ const APP_LOGO = "/logo.png";
 const navItems = [
   { icon: LayoutDashboard, label: "ダッシュボード", path: "/dashboard" },
   { icon: MessageSquare, label: "チャット管理", path: "/chats" },
+  { icon: BellRing, label: "Shopee通知", path: "/notifications" },
   { icon: ListTodo, label: "タスク管理", path: "/tasks" },
   { icon: FileText, label: "テンプレート", path: "/templates" },
   { icon: Zap, label: "自動返信設定", path: "/auto-reply" },
@@ -286,7 +287,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             </div>
           </Link>
           <div className="flex items-center gap-2 flex-shrink-0">
-            <HeaderNotificationCenter />
             <div className="w-10 h-10 rounded-2xl gradient-primary flex items-center justify-center hidden sm:flex shadow-md">
               <span className="text-white text-sm font-bold">田</span>
             </div>
