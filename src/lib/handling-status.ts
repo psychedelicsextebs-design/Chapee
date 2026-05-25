@@ -25,15 +25,19 @@ export function isHandlingStatus(v: unknown): v is HandlingStatus {
 
 export const HANDLING_STATUS_LABELS: Record<HandlingStatus, string> = {
   unreplied: "未返信",
-  auto_replied_pending: "自動返信済み",
+  auto_replied_pending: "自動返信のみ・要対応",
   in_progress: "対応中",
   completed: "対応完了",
 };
 
-/** 一覧行の左ボーダー + 淡い背景 */
+/**
+ * 一覧行の左ボーダー + 淡い背景。
+ * auto_replied_pending は「自動返信しただけで人間が未対応」= フォロー漏れが
+ * Shopee ペナルティに直結するため、未読 (red) と同等に強く目立たせる。
+ */
 export const HANDLING_STATUS_ROW_STYLE: Record<HandlingStatus, string> = {
   unreplied: "border-l-4 border-l-red-500 bg-red-50/35",
-  auto_replied_pending: "border-l-4 border-l-amber-500 bg-amber-50/30",
+  auto_replied_pending: "border-l-4 border-l-amber-500 bg-amber-50/60",
   in_progress: "border-l-4 border-l-sky-600 bg-sky-50/25",
   completed: "border-l-4 border-l-emerald-600/50 bg-emerald-50/15",
 };

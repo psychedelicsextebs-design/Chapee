@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { StaffSendKindPill, type LastStaffSendKind } from "@/components/StaffSendKindPill";
+import { HandlingStatusBadge } from "@/components/HandlingStatusBadge";
 import {
   dispatchShopNotificationsRefresh,
   sumNewNotificationIdsFromSyncResults,
@@ -456,7 +457,7 @@ export default function ChatsPage() {
           </div>
         </div>
 
-        {/* 対応ステータス（未返信 / 自動返信済み要対応 / 対応中 / 完了） */}
+        {/* 対応ステータス（未返信 / 自動返信のみ・要対応 / 対応中 / 完了） */}
         <div>
           <label className="text-gray-700 text-sm font-semibold mb-2 block">
             対応ステータス
@@ -607,14 +608,7 @@ export default function ChatsPage() {
                       <span className="text-gray-900 font-medium text-sm">{chat.elapsed}h</span>
                     </td>
                     <td className="px-4 py-3">
-                      <div
-                        className={cn(
-                          "inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium border leading-tight max-w-[200px]",
-                          HANDLING_STATUS_BADGE_STYLE[hs]
-                        )}
-                      >
-                        {HANDLING_STATUS_LABELS[hs]}
-                      </div>
+                      <HandlingStatusBadge status={hs} />
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">

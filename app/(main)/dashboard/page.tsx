@@ -17,6 +17,11 @@ import { toast } from "sonner";
 import { useNotificationSounds } from "@/lib/useNotificationSounds";
 import { getNotificationSoundsEnabled } from "@/lib/notification-sound-settings";
 import { StaffSendKindPill, type LastStaffSendKind } from "@/components/StaffSendKindPill";
+import { HandlingStatusBadge } from "@/components/HandlingStatusBadge";
+import {
+  type HandlingStatus,
+  HANDLING_STATUS_ROW_STYLE,
+} from "@/lib/handling-status";
 import {
   dispatchShopNotificationsRefresh,
   sumNewNotificationIdsFromSyncResults,
@@ -121,6 +126,7 @@ type Chat = {
   pinned: boolean;
   status: string;
   type?: ChatType;
+  handling_status?: HandlingStatus;
   last_staff_send_kind?: LastStaffSendKind | null;
 };
 
@@ -354,6 +360,11 @@ export default function DashboardPage() {
     () => chats.filter((c) => c.unread > 0).length,
     [chats]
   );
+  /** 自動返信のみで人間が未対応 = フォロー漏れ防止のため強調表示する会話数 */
+  const followUpCount = useMemo(
+    () => chats.filter((c) => c.handling_status === "auto_replied_pending").length,
+    [chats]
+  );
   const chatsSortedUnreadFirst = useMemo(() => {
     return [...chats].sort((a, b) => {
       const ua = a.unread > 0 ? 1 : 0;
@@ -514,6 +525,28 @@ export default function DashboardPage() {
             onClick={() => router.push("/chats?unread_only=1")}
           >
             未読一覧へ
+          </Button>
+        </div>
+      )}
+
+      {followUpCount > 0 && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/90 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2 text-amber-950 min-w-0">
+            <AlertCircle className="shrink-0 mt-0.5" size={20} />
+            <div>
+              <p className="font-bold text-sm">自動返信のみ・要対応の会話があります</p>
+              <p className="text-xs text-amber-900/90 mt-0.5">
+                {followUpCount} 件は自動返信だけで、まだ人間が対応していません（バイヤーへのフォローが必要です）
+              </p>
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            className="shrink-0 bg-amber-600 hover:bg-amber-700 text-white"
+            onClick={() => router.push("/chats?handling=auto_replied_pending")}
+          >
+            要対応一覧へ
           </Button>
         </div>
       )}
@@ -716,6 +749,8 @@ export default function DashboardPage() {
                   onClick={() => router.push(`/chats/${chat.id}`)}
                   className={cn(
                     "flex items-center gap-4 px-5 py-4 hover:bg-gray-50 cursor-pointer transition-all group",
+                    chat.handling_status === "auto_replied_pending" &&
+                      HANDLING_STATUS_ROW_STYLE.auto_replied_pending,
                     chat.unread > 0 && "bg-red-50/40 border-l-4 border-l-red-500"
                   )}
                   style={{ animationDelay: `${index * 30}ms` }}
@@ -741,6 +776,9 @@ export default function DashboardPage() {
                         <span className="text-xs px-2 py-0.5 rounded-full bg-red-600 text-white font-bold tabular-nums">
                           未読 {chat.unread}
                         </span>
+                      )}
+                      {chat.handling_status && (
+                        <HandlingStatusBadge status={chat.handling_status} />
                       )}
                       <StaffSendKindPill kind={chat.last_staff_send_kind} />
                     </div>
