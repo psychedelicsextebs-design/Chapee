@@ -19,13 +19,15 @@ import {
  *     -H "Authorization: Bearer <CRON_SECRET>"
  */
 export async function GET(request: NextRequest) {
+  // 認証あり (Bearer ${CRON_SECRET} or ?key=...) なら顧客名サンプルも返す。
+  // 認証なしでもブラウザから件数だけは確認できる（個人情報は含めない）。
   const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret) {
-    const auth = request.headers.get("authorization");
-    if (auth !== `Bearer ${cronSecret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const auth = request.headers.get("authorization");
+  const keyParam = new URL(request.url).searchParams.get("key");
+  const authorized =
+    !cronSecret ||
+    auth === `Bearer ${cronSecret}` ||
+    keyParam === cronSecret;
 
   const col = await getCollection<{
     conversation_id: string;
@@ -115,12 +117,16 @@ export async function GET(request: NextRequest) {
 
   return NextResponse.json({
     success: true,
+    authorized,
     total: docs.length,
     byChatType,
     reclassifiedWithCurrentLogic: reclassified,
     wouldChange,
     topMessageTypes,
-    notificationSample,
-    wouldBecomeNotificationSample,
+    // 顧客名を含むサンプルは認証時のみ
+    notificationSample: authorized ? notificationSample : undefined,
+    wouldBecomeNotificationSample: authorized
+      ? wouldBecomeNotificationSample
+      : undefined,
   });
 }
