@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Search, Users as UsersIcon,
@@ -169,7 +169,12 @@ export default function ChatsPage() {
     };
   }, [search]);
 
+  /** loadChats の世代カウンタ。古いフェッチの後着上書きを防ぐ。 */
+  const loadSeqRef = useRef(0);
   const loadChats = useCallback(async () => {
+    // 同時に複数の loadChats が走った場合、最後に開始したものだけが setChats する
+    // （フィルタ切替直後の旧フェッチが新フェッチ結果を後着で上書きするのを防ぐ）。
+    const seq = ++loadSeqRef.current;
     // 通常はバイヤー会話のみ (通知は除外)。通知フィルタ ON のときだけ通知に絞る。
     const url = notificationOnly
       ? "/api/chats?type=notification"
@@ -208,7 +213,8 @@ export default function ChatsPage() {
         last_staff_send_kind: c.last_staff_send_kind ?? null,
       })
     );
-    setChats(rows);
+    // 後発の loadChats が既に走っていたら、この（古い）結果は捨てる
+    if (seq === loadSeqRef.current) setChats(rows);
   }, [notificationOnly]);
 
   useEffect(() => {
