@@ -6,7 +6,7 @@ import {
   Search, Users as UsersIcon,
   ChevronRight, User,
   AlertCircle, Loader2, RefreshCw, Download,
-  MessageSquarePlus, CheckCircle2,
+  MessageSquarePlus, CheckCircle2, Bell, MessageSquare,
 } from "lucide-react";
 import ColdStartSendModal, { type ColdStartSendTarget } from "@/components/ColdStartSendModal";
 import { cn } from "@/lib/utils";
@@ -99,6 +99,8 @@ export default function ChatsPage() {
   const [selectedHandling, setSelectedHandling] = useState<HandlingStatus | "all">("all");
   const [search, setSearch] = useState("");
   const [unreadOnly, setUnreadOnly] = useState(false);
+  /** true のとき Shopee 通知 (chat_type=notification) だけを表示する */
+  const [notificationOnly, setNotificationOnly] = useState(false);
   const [selectedChats, setSelectedChats] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -122,11 +124,13 @@ export default function ChatsPage() {
     else if (h && isHandlingStatus(h)) setSelectedHandling(h);
     const q = searchParams.get("q");
     if (q) setSearch(q);
+    // ダッシュボードの「Shopee通知」カードからは ?type=notification で遷移する
+    setNotificationOnly(searchParams.get("type") === "notification");
   }, [searchParams]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedHandling, selectedCountry, unreadOnly, search]);
+  }, [selectedHandling, selectedCountry, unreadOnly, notificationOnly, search]);
 
   // コールドスタート検索: 検索文字列が 2 文字以上の時、 500ms デバウンスで全 shop 並列検索
   useEffect(() => {
@@ -166,9 +170,11 @@ export default function ChatsPage() {
   }, [search]);
 
   const loadChats = useCallback(async () => {
-    const res = await fetch(
-      "/api/chats?exclude_chat_types=notification"
-    );
+    // 通常はバイヤー会話のみ (通知は除外)。通知フィルタ ON のときだけ通知に絞る。
+    const url = notificationOnly
+      ? "/api/chats?type=notification"
+      : "/api/chats?exclude_chat_types=notification";
+    const res = await fetch(url);
     if (!res.ok) throw new Error("Failed to load chats");
     const data = await res.json();
     const rows: ChatRow[] = (data.chats || []).map(
@@ -203,7 +209,7 @@ export default function ChatsPage() {
       })
     );
     setChats(rows);
-  }, []);
+  }, [notificationOnly]);
 
   useEffect(() => {
     (async () => {
@@ -483,6 +489,39 @@ export default function ChatsPage() {
                 {c}
               </button>
             ))}
+          </div>
+        </div>
+
+        {/* 種別フィルタ（チャット / Shopee通知） */}
+        <div>
+          <label className="text-gray-700 text-sm font-semibold mb-2 block">種別</label>
+          <div className="flex gap-2 flex-wrap">
+            <button
+              type="button"
+              onClick={() => setNotificationOnly(false)}
+              className={cn(
+                "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border flex items-center gap-1.5",
+                !notificationOnly
+                  ? "bg-primary text-white border-primary"
+                  : "bg-white text-gray-700 border-gray-200 hover:border-primary/50"
+              )}
+            >
+              <MessageSquare size={14} />
+              チャット
+            </button>
+            <button
+              type="button"
+              onClick={() => setNotificationOnly(true)}
+              className={cn(
+                "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border flex items-center gap-1.5",
+                notificationOnly
+                  ? "bg-amber-600 text-white border-amber-600"
+                  : "bg-white text-gray-700 border-gray-200 hover:border-amber-300"
+              )}
+            >
+              <Bell size={14} />
+              Shopee通知
+            </button>
           </div>
         </div>
 

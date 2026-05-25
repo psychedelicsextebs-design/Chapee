@@ -560,7 +560,7 @@ export default function DashboardPage() {
             style={{ animationDelay: `${index * 50}ms` }}
             onClick={() => {
               if (label === "Shopee通知") {
-                router.push("/chats?focus=notifications");
+                router.push("/chats?type=notification");
                 return;
               }
               if (label === "未読メッセージ") {
