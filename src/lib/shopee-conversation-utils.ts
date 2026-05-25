@@ -187,16 +187,18 @@ export function extractShopLogoFromShopInfo(data: Record<string, unknown>): stri
   return undefined;
 }
 
-/** システム通知系カードのみ（通常バイヤーチャットの order 通知は除外） */
-const NOTIFICATION_ONLY_MESSAGE_TYPES = new Set([
-  "return_refund_card",
-  "out_of_stock_reminder_card",
-  "faq_liveagent_prompt",
-]);
-
 /**
- * チャット種別（一覧の「通知」タブ用）
- * order_notification / system だけでは一般バイヤー会話も拾うため含めない。
+ * チャット種別。
+ *
+ * 「Shopee の通知」として本当に見たいもの（Parcel Delivered / Order Cancelled /
+ * Payment Transfer 等の Seller Center 通知）は会話一覧ではなく
+ * get_shop_notification（🔔 HeaderNotificationCenter）から来る別系統。
+ *
+ * 会話一覧側で notification 扱いするのは「相手が Shopee 通知アカウント」の場合のみ。
+ * 以前は return_refund_card / out_of_stock_reminder_card / faq_liveagent_prompt を
+ * notification にしていたが、これらは**普通のバイヤー会話の最後がシステムカード
+ * だっただけ**で、notification 扱いするとメイン一覧から隠れて見落とす
+ * （特に返品・返金リクエスト）。そのため buyer に分類する（2026-05-25 修正）。
  */
 export function inferChatTypeFromShopee(conv: {
   latest_message_type?: string;
@@ -205,7 +207,6 @@ export function inferChatTypeFromShopee(conv: {
   const name = (conv.to_name || "").toLowerCase();
   const mt = (conv.latest_message_type || "").toLowerCase();
   if (name.includes("shopee") && name.includes("通知")) return "notification";
-  if (NOTIFICATION_ONLY_MESSAGE_TYPES.has(mt)) return "notification";
   if (mt.includes("affiliate")) return "affiliate";
   return "buyer";
 }

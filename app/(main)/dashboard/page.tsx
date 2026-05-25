@@ -28,6 +28,7 @@ import {
 } from "@/lib/chapee-shop-notifications-events";
 import { marketFilterChipsWithAll } from "@/lib/shopee-markets";
 import { safeJsonFetch, formatSafeFetchError } from "@/lib/safe-fetch";
+import { parseShopNotificationPayload } from "@/lib/shopee-shop-notification-parse";
 
 const COUNTRIES = marketFilterChipsWithAll();
 
@@ -150,6 +151,8 @@ export default function DashboardPage() {
   const oauthRecoveryRef = useRef(false);
   /** 同期開始時刻 (UI 表示用、経過秒数の計算と auto-clear 安全網のため) */
   const [syncStartedAt, setSyncStartedAt] = useState<Date | null>(null);
+  /** 本物の Shopee Seller Center 通知（🔔）の未読総数。ダッシュのカードに表示。 */
+  const [shopNotifUnread, setShopNotifUnread] = useState(0);
 
   // ★ 絶対安全網: どんな経路で flag が立ったままになっても 75 秒で必ずクリア。
   //   safeJsonFetch のタイムアウトが効けばここまで来ないが、未来のコード変更で
@@ -305,6 +308,35 @@ export default function DashboardPage() {
     };
   }, [fetchChats, runBackgroundSync]);
 
+  // 本物の Shopee 通知（🔔 Seller Center 通知）の未読総数を取得してカードに表示。
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await safeJsonFetch<Record<string, unknown>>(
+          "/api/shopee/shop-notifications?page_size=1",
+          {},
+          { timeoutMs: CHATS_FETCH_TIMEOUT_MS, label: "/api/shopee/shop-notifications" }
+        );
+        let unread = 0;
+        if (
+          data.multi_shop === true &&
+          typeof data.chapee_server_unread_total === "number"
+        ) {
+          unread = data.chapee_server_unread_total;
+        } else {
+          unread = parseShopNotificationPayload(data).serverUnreadTotal ?? 0;
+        }
+        if (!cancelled) setShopNotifUnread(Math.max(0, unread));
+      } catch {
+        /* 通知未読の取得失敗はダッシュ全体を止めない */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // 10分ごとに Shopee へ同期（ダッシュボードを開いている間のみ。タブが非表示ならスキップ）
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -349,7 +381,6 @@ export default function DashboardPage() {
 
   // チャットタイプ別の統計
   const buyerChats = chats.filter(c => c.type === "buyer");
-  const notificationChats = chats.filter(c => c.type === "notification");
   const affiliateChats = chats.filter(c => c.type === "affiliate");
 
   const totalUnreadMessages = useMemo(
@@ -406,7 +437,7 @@ export default function DashboardPage() {
 
   const stats = [
     { label: "バイヤーチャット", value: buyerChats.length, icon: ShoppingCart, color: "text-blue-600", bg: "bg-blue-50 border-blue-200" },
-    { label: "Shopee通知", value: notificationChats.length, icon: Bell, color: "text-amber-600", bg: "bg-amber-50 border-amber-200" },
+    { label: "Shopee通知", value: shopNotifUnread, icon: Bell, color: "text-amber-600", bg: "bg-amber-50 border-amber-200" },
     { label: "アフィリエイト", value: affiliateChats.length, icon: TrendingUp, color: "text-purple-600", bg: "bg-purple-50 border-purple-200" },
     { label: "未読メッセージ", value: totalUnreadMessages, icon: AlertCircle, color: "text-red-600", bg: "bg-red-50 border-red-200" },
   ];
@@ -560,7 +591,9 @@ export default function DashboardPage() {
             style={{ animationDelay: `${index * 50}ms` }}
             onClick={() => {
               if (label === "Shopee通知") {
-                router.push("/chats?type=notification");
+                // 本物の Seller Center 通知は会話一覧ではなく 🔔 に出る。
+                // ?focus=notifications で HeaderNotificationCenter のベルを開く。
+                router.push("/dashboard?focus=notifications");
                 return;
               }
               if (label === "未読メッセージ") {
