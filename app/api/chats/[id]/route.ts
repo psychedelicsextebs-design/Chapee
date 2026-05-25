@@ -30,14 +30,20 @@ export async function PATCH(
       shop_id: number;
     }>("shopee_conversations");
 
+    // 「対応完了」にする時は保留中の自動返信予約も解除する（返信なし完了後の
+    // 再発火を防ぐ保険。対象が古い会話なら通常 pending は既に false）。
+    const set: Record<string, unknown> = {
+      handling_status: status,
+      updated_at: new Date(),
+    };
+    if (status === "completed") {
+      set.auto_reply_pending = false;
+      set.auto_reply_due_at = null;
+    }
+
     const result = await col.updateOne(
       { conversation_id: String(conversationId) },
-      {
-        $set: {
-          handling_status: status,
-          updated_at: new Date(),
-        },
-      }
+      { $set: set }
     );
 
     if (result.matchedCount === 0) {

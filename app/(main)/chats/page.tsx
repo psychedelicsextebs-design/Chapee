@@ -6,12 +6,22 @@ import {
   Search, Users as UsersIcon,
   ChevronRight, User,
   AlertCircle, Loader2, RefreshCw, Download,
-  MessageSquarePlus,
+  MessageSquarePlus, CheckCircle2,
 } from "lucide-react";
 import ColdStartSendModal, { type ColdStartSendTarget } from "@/components/ColdStartSendModal";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import { StaffSendKindPill, type LastStaffSendKind } from "@/components/StaffSendKindPill";
 import { HandlingStatusBadge } from "@/components/HandlingStatusBadge";
@@ -92,6 +102,10 @@ export default function ChatsPage() {
   const [selectedChats, setSelectedChats] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
+
+  /** 「返信なし対応完了」の確認対象。単体は会話ID、一括は "bulk"。 */
+  const [completeTarget, setCompleteTarget] = useState<string | "bulk" | null>(null);
+  const [completing, setCompleting] = useState(false);
 
   // コールドスタート検索 (会話なし注文バイヤー)
   const [coldStartResults, setColdStartResults] = useState<ColdStartBuyer[]>([]);
@@ -309,6 +323,43 @@ export default function ChatsPage() {
     toast.info(`${selectedChats.length}件の一括割当は、担当者API連携後に有効にできます`);
   };
 
+  /** 確認ダイアログで「対応完了にする」を押した時の実処理（単体 / 一括 共通） */
+  const handleConfirmComplete = async () => {
+    if (!completeTarget) return;
+    const isBulk = completeTarget === "bulk";
+    const ids = isBulk ? selectedChats : [completeTarget];
+    if (ids.length === 0) {
+      setCompleteTarget(null);
+      return;
+    }
+    setCompleting(true);
+    try {
+      if (isBulk) {
+        const res = await fetch("/api/chats/bulk-complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ conversation_ids: ids }),
+        });
+        if (!res.ok) throw new Error("bulk failed");
+      } else {
+        const res = await fetch(`/api/chats/${encodeURIComponent(ids[0])}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ handling_status: "completed" }),
+        });
+        if (!res.ok) throw new Error("patch failed");
+      }
+      await loadChats();
+      if (isBulk) setSelectedChats([]);
+      toast.success(`${ids.length}件を対応完了にしました（返信なし）`);
+    } catch {
+      toast.error("対応完了への更新に失敗しました");
+    } finally {
+      setCompleting(false);
+      setCompleteTarget(null);
+    }
+  };
+
   return (
     <div className="space-y-5 animate-fade-in max-w-7xl">
       {/* Header */}
@@ -371,6 +422,16 @@ export default function ChatsPage() {
               <RefreshCw size={16} />
             )}
             Shopeeと同期
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setCompleteTarget("bulk")}
+            disabled={selectedChats.length === 0 || completing}
+            className="gap-2 rounded-xl border-emerald-300 text-emerald-800 hover:bg-emerald-50 hover:text-emerald-900"
+          >
+            <CheckCircle2 size={16} />
+            選択を対応完了（返信なし）
           </Button>
           <Button
             variant="outline"
@@ -617,7 +678,24 @@ export default function ChatsPage() {
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <ChevronRight size={16} className="text-gray-400" />
+                      <div className="flex items-center gap-1">
+                        {hs !== "completed" && (
+                          <button
+                            type="button"
+                            title="返信せずに対応完了にする"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setCompleteTarget(chat.id);
+                            }}
+                            disabled={completing}
+                            className="inline-flex items-center gap-1 rounded-md border border-emerald-300 text-emerald-700 hover:bg-emerald-50 px-2 py-1 text-[11px] font-medium disabled:opacity-50"
+                          >
+                            <CheckCircle2 size={13} />
+                            完了
+                          </button>
+                        )}
+                        <ChevronRight size={16} className="text-gray-400" />
+                      </div>
                     </td>
                   </tr>
                 );
@@ -759,6 +837,39 @@ export default function ChatsPage() {
           void loadChats();
         }}
       />
+
+      <AlertDialog
+        open={completeTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !completing) setCompleteTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>返信せずに対応完了にしますか？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {completeTarget === "bulk"
+                ? `選択した ${selectedChats.length} 件を、バイヤーへ返信せずに「対応完了」にします。`
+                : "この会話を、バイヤーへ返信せずに「対応完了」にします。"}
+              <br />
+              保留中の自動返信予約も解除されます。よろしいですか？
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={completing}>キャンセル</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void handleConfirmComplete();
+              }}
+              disabled={completing}
+              className="bg-emerald-600 hover:bg-emerald-700"
+            >
+              {completing ? "処理中…" : "対応完了にする"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
