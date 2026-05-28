@@ -84,6 +84,7 @@ export async function GET(request: NextRequest) {
   const name = (url.searchParams.get("name") ?? "").trim();
   const conversationParam = (url.searchParams.get("conversation") ?? "").trim();
   const orderSnParam = (url.searchParams.get("order_sn") ?? "").trim();
+  const trackingNoParam = (url.searchParams.get("tracking_no") ?? "").trim();
   const live =
     url.searchParams.get("live") === "1" ||
     url.searchParams.get("live") === "true";
@@ -93,9 +94,12 @@ export async function GET(request: NextRequest) {
   );
   const since = new Date(Date.now() - hours * 3600 * 1000);
 
-  if (!name && !conversationParam && !orderSnParam) {
+  if (!name && !conversationParam && !orderSnParam && !trackingNoParam) {
     return NextResponse.json(
-      { error: "name / conversation / order_sn のいずれかを指定してください" },
+      {
+        error:
+          "name / conversation / order_sn / tracking_no のいずれかを指定してください",
+      },
       { status: 400 }
     );
   }
@@ -347,6 +351,60 @@ export async function GET(request: NextRequest) {
     obsStatusCountByOrder[key][st] = (obsStatusCountByOrder[key][st] ?? 0) + 1;
   }
 
+  // ---- 5.5 tracking_no 横断検索 (同一追跡番号を複数 order が共有しているか) ----
+  // queue は tracking_no を保持しているので、 そこから order_sn を引く。
+  // observation (code 4) も raw_payload.data.tracking_no で引く。
+  let trackingLookup: Record<string, unknown> | null = null;
+  if (trackingNoParam) {
+    const queueByTracking = await queueCol
+      .find({ tracking_no: trackingNoParam })
+      .sort({ created_at: -1 })
+      .limit(100)
+      .toArray();
+    const obsByTracking = await obsCol
+      .find({
+        code: 4,
+        $or: [
+          { "raw_payload.data.tracking_no": trackingNoParam },
+          { "raw_payload.data.tracking_number": trackingNoParam },
+        ],
+      })
+      .sort({ received_at: -1 })
+      .limit(100)
+      .toArray();
+    const orderSnsForTracking = Array.from(
+      new Set(queueByTracking.map((q) => q.order_sn))
+    );
+    // それらの order_sn の send_log (tracking_registered が実送信されたか)
+    const sendLogForTracking =
+      orderSnsForTracking.length > 0
+        ? await logCol
+            .find({ order_sn: { $in: orderSnsForTracking } })
+            .sort({ sent_at: -1 })
+            .limit(100)
+            .toArray()
+        : [];
+    trackingLookup = {
+      tracking_no: trackingNoParam,
+      distinct_order_sns: orderSnsForTracking,
+      queue: queueByTracking.map(sampleQueue),
+      send_log: sendLogForTracking.map(sampleLog),
+      observations_code4: obsByTracking.map((e) => {
+        const data =
+          ((e.raw_payload?.data ?? {}) as Record<string, unknown>) ?? {};
+        return {
+          received_at: isoOrNull(e.received_at),
+          ordersn: String(data.ordersn ?? data.order_sn ?? "") || null,
+          tracking_no: String(
+            data.tracking_no ?? data.tracking_number ?? ""
+          ) || null,
+          signature_valid: Boolean(e.signature_valid),
+          note: e.note ?? null,
+        };
+      }),
+    };
+  }
+
   // ---- 6. index 構成 ----
   let sendLogIndexes: unknown = null;
   let queueIndexes: unknown = null;
@@ -367,6 +425,7 @@ export async function GET(request: NextRequest) {
       name: name || null,
       conversation: conversationParam || null,
       order_sn: orderSnParam || null,
+      tracking_no: trackingNoParam || null,
       hours,
       since: since.toISOString(),
     },
@@ -390,5 +449,6 @@ export async function GET(request: NextRequest) {
       event_triggered_send_log: sendLogIndexes,
       event_triggered_messages: queueIndexes,
     },
+    tracking_lookup: trackingLookup,
   });
 }
