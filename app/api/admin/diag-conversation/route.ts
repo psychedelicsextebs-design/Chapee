@@ -15,6 +15,8 @@ import {
   displayFromShopeeChatMessage,
   shopeeMessageTimeToMs,
 } from "@/lib/shopee-conversation-utils";
+import { fetchAllConversationMessages } from "@/lib/shopee-api";
+import { getValidToken, resolveCountryForShop } from "@/lib/shopee-token";
 
 /**
  * GET /api/admin/diag-conversation?name=alexsmiths&hours=720
@@ -82,6 +84,9 @@ export async function GET(request: NextRequest) {
   const name = (url.searchParams.get("name") ?? "").trim();
   const conversationParam = (url.searchParams.get("conversation") ?? "").trim();
   const orderSnParam = (url.searchParams.get("order_sn") ?? "").trim();
+  const live =
+    url.searchParams.get("live") === "1" ||
+    url.searchParams.get("live") === "true";
   const hours = Math.max(
     1,
     Math.min(2160, Number(url.searchParams.get("hours") ?? 720))
@@ -167,6 +172,52 @@ export async function GET(request: NextRequest) {
       });
     }
 
+    // Shopee API からライブで会話メッセージを取得 (DB 未同期の会話でも実スレッドを見る)。
+    // read-only (fetchAllConversationMessages は取得のみ)。
+    let liveTimeline: Record<string, unknown>[] | null = null;
+    let liveError: string | null = null;
+    if (live) {
+      try {
+        const token = await getValidToken(Number(c.shop_id));
+        const country = await resolveCountryForShop(
+          Number(c.shop_id),
+          c.country
+        );
+        const rawList = (await fetchAllConversationMessages(
+          token,
+          Number(c.shop_id),
+          c.conversation_id,
+          country ? { country } : undefined
+        )) as Record<string, unknown>[];
+        const mapped = rawList.map((row) => {
+          const disp = displayFromShopeeChatMessage(row);
+          const osn = disp.order?.order_sn?.trim();
+          if (osn) orderSnSet.add(osn);
+          const fromId = Number(row.from_id ?? row.from_user_id ?? 0);
+          const toId = Number(row.to_id ?? row.to_user_id ?? 0);
+          const ms = shopeeMessageTimeToMs(
+            row.timestamp ?? row.created_timestamp ?? row.time
+          );
+          return {
+            ts: new Date(ms).toISOString(),
+            ms,
+            from_id: fromId,
+            to_id: toId,
+            message_type: String(row.message_type ?? row.type ?? ""),
+            kind: disp.kind,
+            order_sn: osn ?? null,
+            summary: (disp.summary ?? "").slice(0, 120),
+          };
+        });
+        mapped.sort(
+          (a, b) => (a.ms as number) - (b.ms as number)
+        );
+        liveTimeline = mapped;
+      } catch (e) {
+        liveError = e instanceof Error ? e.message : String(e);
+      }
+    }
+
     const log = c.staff_message_kind_log ?? [];
     convSummaries.push({
       conversation_id: c.conversation_id,
@@ -183,6 +234,8 @@ export async function GET(request: NextRequest) {
       staff_message_kind_log_last: log.length ? log[log.length - 1] : null,
       order_sns_from_chat: Array.from(orderSnsFromChat),
       message_timeline_tail: messageTimeline.slice(-30),
+      live_timeline: liveTimeline,
+      live_error: liveError,
     });
   }
 
