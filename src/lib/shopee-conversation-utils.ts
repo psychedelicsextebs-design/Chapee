@@ -222,12 +222,33 @@ export function inferChatMessageSender(
   const shop = Number(shopId);
   const buyer = Number(buyerUserId);
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
-  if (Number.isFinite(shop) && fromId === shop) return "staff";
-  if (buyer > 0 && Number.isFinite(buyer) && fromId === buyer) return "customer";
+
+  // from_id が取れているとき: buyer の user_id と一致したときだけ customer。
+  // それ以外 (店舗本体 shop_id / 出品者個人 user_id / サブアカウント) は staff。
+  //
+  // 重要: 出品者がチャットを送ると from_id は「出品者の user_id」で来る。これは
+  // shop_id とは別番号 (例: shop_id=1704031241 に対し from_id=7792491535)。
+  // 旧実装は `from_id === shop_id` だけを staff としていたため、出品者送信や
+  // from_id=0 のスタンプを customer と誤判定し、resolveHandlingStatus が
+  // 「最終発言はバイヤー」とみなして手動返信後も「未返信」に戻していた。
+  // auto-reply 側の classifyShopeeMessageSender と同じ buyer 基準に統一する。
+  if (Number.isFinite(fromId) && fromId > 0) {
+    if (buyer > 0 && Number.isFinite(buyer) && fromId === buyer) return "customer";
+    return "staff";
+  }
+
+  // from_id=0 (sticker / system card 等) は to_id で向きを推定する。
+  const toId = Number(msg.to_id ?? msg.to_user_id ?? 0);
+  if (Number.isFinite(toId) && toId > 0) {
+    if (buyer > 0 && Number.isFinite(buyer) && toId === buyer) return "staff"; // buyer 宛 = 店舗送信
+    if (Number.isFinite(shop) && shop > 0 && toId === shop) return "customer"; // shop 宛 = buyer 発信
+  }
+
+  // from_shop_id が店舗なら staff。
   const fromShop = msg.from_shop_id ?? msg.sender_shop_id;
   if (fromShop != null && Number(fromShop) === shop) return "staff";
-  // from_id が店舗でなければバイヤー側扱い（システム・相手）
-  if (fromId !== 0 && fromId !== shop) return "customer";
+
+  // 判定不能 (from_id=0, to_id 不明) は従来通り customer 側に倒す。
   return "customer";
 }
 

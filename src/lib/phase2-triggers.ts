@@ -300,6 +300,31 @@ export async function processDuePhase2Triggers(
     // どのフェーズで失敗したかを last_error / errors に残すためのトラッカー
     let phase: string = "init";
     try {
+      // 0) 送信前 dedup (最重要):
+      //    既に send_log に同じ (shop_id, order_sn, event_type) があれば送らない。
+      //
+      //    Shopee は同じ注文に対し order_status_push (code 3) / order_trackingno_push
+      //    (code 4) を何度も再送する (実測: 1 注文に code 4 が 5 回)。 そのたびに
+      //    enqueue され、 前回の queue 行が既に sent/failed/cancelled だと partial
+      //    unique (status="pending" 限定) に引っかからず新しい pending が作れてしまう。
+      //
+      //    send_log の unique index は「送信後」に E11000 を返すだけ (send が先、
+      //    log insert が後) なので、 二重送信そのものは防げず、 バイヤーに同じ
+      //    メッセージが再度届いてしまう (5/14 重複発送通知 / Shopee の "repetitive
+      //    content" anti-spam 抵触の真因)。 ここで送信前に弾く。
+      //    unique index は競合 (同時 drain) の最終防壁として残す。
+      phase = "prededup";
+      const alreadySent = await logCol.findOne({
+        shop_id: doc.shop_id,
+        order_sn: doc.order_sn,
+        event_type: doc.event_type,
+      });
+      if (alreadySent) {
+        await markCancelled(queueCol, doc, "already sent (pre-send dedup)");
+        result.skipped_duplicate++;
+        continue;
+      }
+
       // 1) 設定ベースのゲート (event_type 全体)
       phase = "settings_gate";
       const eventCfg = settings.triggers[doc.event_type];
