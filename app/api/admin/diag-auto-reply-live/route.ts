@@ -55,15 +55,35 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
+  const stepsDone: string[] = [];
+  try {
+    return await runDiag(stepsDone);
+  } catch (e) {
+    return NextResponse.json(
+      {
+        error: "diag crashed",
+        crashed_at: stepsDone[stepsDone.length - 1] ?? "<none>",
+        steps_done: stepsDone,
+        message: e instanceof Error ? e.message : String(e),
+        stack: e instanceof Error ? e.stack : null,
+      },
+      { status: 500 }
+    );
+  }
+}
+
+async function runDiag(stepsDone: string[]) {
   const now = new Date();
   const nowMs = now.getTime();
   const cutoff24 = new Date(nowMs - 24 * HOUR);
   const cutoff24Ms = cutoff24.getTime();
   const cutoff7d = new Date(nowMs - 7 * 24 * HOUR);
 
+  stepsDone.push("getCollection(shopee_conversations)");
   const convCol = await getCollection<ConvDoc>("shopee_conversations");
 
   // 1) per-shop 集計 (auto-reply pipeline diag と同一)
+  stepsDone.push("per-shop aggregate");
   const perShopRaw = await convCol
     .aggregate<{
       _id: number;
@@ -147,7 +167,9 @@ export async function GET(request: NextRequest) {
     auto_reply_due_at: { $lte: now },
   };
 
+  stepsDone.push("rescue countDocuments");
   const rescueCount = await convCol.countDocuments(rescueFilter);
+  stepsDone.push("rescue sample find");
   const rescueSample = await convCol
     .find(rescueFilter)
     .limit(5)
@@ -160,7 +182,9 @@ export async function GET(request: NextRequest) {
     })
     .toArray();
 
+  stepsDone.push("process countDocuments");
   const processCount = await convCol.countDocuments(processFilter);
+  stepsDone.push("process sample find");
   const processSample = await convCol
     .find(processFilter)
     .limit(5)
@@ -173,6 +197,7 @@ export async function GET(request: NextRequest) {
     .toArray();
 
   // 3) tokens
+  stepsDone.push("getCollection(shopee_tokens)");
   const tokenCol = await getCollection<{
     shop_id: number;
     country?: string;
@@ -181,6 +206,7 @@ export async function GET(request: NextRequest) {
     expires_at?: Date;
     updated_at?: Date;
   }>("shopee_tokens");
+  stepsDone.push("tokens find");
   const tokens = await tokenCol.find({}).toArray();
   const tokensStatus = tokens.map((t) => ({
     shop_id: t.shop_id,
@@ -196,6 +222,7 @@ export async function GET(request: NextRequest) {
   }));
 
   // 4) 直近 24h の buyer 活動 (rescue に何故マッチしないか)
+  stepsDone.push("recent buyers find");
   const recentBuyers = await convCol
     .find({
       chat_type: { $ne: "notification" },
@@ -256,6 +283,7 @@ export async function GET(request: NextRequest) {
   });
 
   // 5) 過去 7日 の auto-reply 実発火
+  stepsDone.push("firings 7d find");
   const firingsRaw = await convCol
     .find({ last_auto_reply_at: { $gte: cutoff7d } })
     .sort({ last_auto_reply_at: -1 })
@@ -278,19 +306,23 @@ export async function GET(request: NextRequest) {
   }));
 
   // 6) auto_reply_settings 生値
+  stepsDone.push("getCollection(auto_reply_settings)");
   const settingsCol = await getCollection<{
     _id: string;
     countries?: Record<string, unknown>;
     template_fix_applied?: boolean;
     updated_at?: Date;
   }>("auto_reply_settings");
+  stepsDone.push("settings findOne");
   const settingsDoc = await settingsCol.findOne({ _id: "singleton" });
 
   // 7) 直近 24h に completed 化された会話 (bulk-complete/PATCH 副作用検証)
+  stepsDone.push("completed count");
   const completedCount = await convCol.countDocuments({
     handling_status: "completed",
     updated_at: { $gte: cutoff24 },
   });
+  stepsDone.push("completed sample find");
   const completedSample = await convCol
     .find({
       handling_status: "completed",
