@@ -669,12 +669,15 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
   const countries = await getSingletonAutoReplyCountries();
   const cutoff = new Date(Date.now() - RESCUE_LOOKBACK_MS);
 
+  // pending=true でも due が誤って未来に書かれた「スタック」状態を自己修復するため
+  // `auto_reply_pending: {$ne: true}` の除外は入れない。 for-loop 内 updateOne は
+  // idempotent (pending=true 上書き、 due=max(lmt+trigger, now) で再計算) なので、
+  // 正常に予約済みの会話には実害なし、 スタック救済のみ効く。
   const candidates = await col
     .find({
       chat_type: { $ne: "notification" },
       customer_id: { $gt: 0 },
       last_message_time: { $gte: cutoff },
-      auto_reply_pending: { $ne: true },
       $or: [
         { last_auto_reply_at: { $exists: false } },
         { last_auto_reply_at: null },
