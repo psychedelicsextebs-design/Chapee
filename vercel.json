@@ -15,6 +15,10 @@
     {
       "path": "/api/cron/health-check",
       "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/shopee/refresh-tokens",
+      "schedule": "0 */6 * * *"
     }
   ]
 }
