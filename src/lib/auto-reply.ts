@@ -70,15 +70,25 @@ export function classifyShopeeMessageSender(
 
 /**
  * Pure helper (testable): walk raw messages and return the latest buyer/staff
- * timestamps (ms since epoch, 0 if none).
+ * timestamps (ms since epoch, 0 if none) plus the *first unreplied* buyer
+ * message timestamp.
+ *
+ * firstUnrepliedBuyerMs は「最後の staff 返信より後の、最も古い buyer 発信」。
+ * Shopee 応答率ペナルティは「最初の未返信 buyer msg」から 12h で起算されるため、
+ * auto-reply の due 起算点はこの値を使う必要がある (lastBuyerMs を使うと連投で
+ * due が後退してペナルティ期限を超過する)。
+ *   - staff 未返信 (lastStaffMs=0): 全 buyer msg が対象 → 最古の buyer msg
+ *   - staff が全 buyer より新しい (lastStaffMs >= lastBuyerMs): 未返信なし → 0
+ *   - 途中 staff 返信 → 続く buyer 発信: staff 以降の最古 buyer msg
  */
 export function computeBuyerStaffLastMs(
   rawMessages: Record<string, unknown>[],
   customerId: number,
   shopId?: number
-): { lastBuyerMs: number; lastStaffMs: number } {
+): { lastBuyerMs: number; lastStaffMs: number; firstUnrepliedBuyerMs: number } {
   let lastBuyerMs = 0;
   let lastStaffMs = 0;
+  const buyerTimestamps: number[] = [];
   for (const msg of rawMessages) {
     const kind = classifyShopeeMessageSender(msg, customerId, shopId);
     if (kind === "unknown") continue;
@@ -86,12 +96,19 @@ export function computeBuyerStaffLastMs(
       msg.timestamp ?? msg.created_timestamp ?? msg.time
     );
     if (kind === "buyer") {
+      buyerTimestamps.push(ts);
       if (ts > lastBuyerMs) lastBuyerMs = ts;
     } else {
       if (ts > lastStaffMs) lastStaffMs = ts;
     }
   }
-  return { lastBuyerMs, lastStaffMs };
+  let firstUnrepliedBuyerMs = 0;
+  for (const ts of buyerTimestamps) {
+    if (ts > lastStaffMs && (firstUnrepliedBuyerMs === 0 || ts < firstUnrepliedBuyerMs)) {
+      firstUnrepliedBuyerMs = ts;
+    }
+  }
+  return { lastBuyerMs, lastStaffMs, firstUnrepliedBuyerMs };
 }
 
 /**
@@ -315,6 +332,7 @@ export async function reviewAutoReplySchedule(
       chat_type?: string;
       auto_reply_pending?: boolean;
       auto_reply_due_at?: Date | null;
+      first_unreplied_buyer_message_time?: Date | null;
       last_auto_reply_at?: Date | null;
       last_message_time?: Date | null;
       staff_message_kind_log?: { id: string; kind: string }[];
@@ -363,6 +381,7 @@ export async function reviewAutoReplySchedule(
     );
     let lastBuyerMs = classified.lastBuyerMs;
     const lastStaffMs = classified.lastStaffMs;
+    let firstUnrepliedBuyerMs = classified.firstUnrepliedBuyerMs;
 
     /**
      * 商品カード問い合わせ救済 (2026-05-11 / gg.ah.goh.goh / shopaholic138 案件)
@@ -401,6 +420,7 @@ export async function reviewAutoReplySchedule(
         lar instanceof Date && lar.getTime() >= lmt.getTime();
       if (!alreadyReplied && staffLog.length === 0) {
         lastBuyerMs = lmt.getTime();
+        firstUnrepliedBuyerMs = lmt.getTime();
         console.log(
           `[auto-reply] review: no-signal fallback (using last_message_time) ` +
             `conv=${convId} shop=${shopId} ` +
@@ -447,121 +467,56 @@ export async function reviewAutoReplySchedule(
     const lastAutoAt = existing.last_auto_reply_at;
     if (lastAutoAt instanceof Date && lastAutoAt.getTime() >= lastBuyerMs) return;
 
-    // Compute correct due time from the actual buyer message timestamp
-    const dueMs = lastBuyerMs + triggerHour * 60 * 60 * 1000;
+    // Compute due from the FIRST unreplied buyer message (Shopee 応答率
+    // ペナルティ 12h 起算点)。 連投で due が後退しないよう lastBuyerMs ではなく
+    // firstUnrepliedBuyerMs を使う。
+    const dueMs = firstUnrepliedBuyerMs + triggerHour * 60 * 60 * 1000;
     const now = Date.now();
     // Note: 過去 due を now に丸める挙動は歴史的経緯で残している。
     // pre-send guard (スタッフ応答の再検証) で誤送信は止まるため実害なし。
-    // 将来的に、新規予約のみ時刻を保持する形にリファクタすべき。
     const due = new Date(dueMs > now ? dueMs : now);
 
-    // Skip write if already scheduled with the same due time (±1 min tolerance)
+    // Skip write if already scheduled with the same due AND first_unreplied
+    // (±1 min tolerance)。 first_unreplied フィールドが未 populate の場合は
+    // 落として updateOne を実行し、フィールドを埋める。
     const existingDue = existing.auto_reply_due_at?.getTime?.();
+    const existingFirstUnreplied =
+      existing.first_unreplied_buyer_message_time?.getTime?.();
     if (
       existing.auto_reply_pending === true &&
       typeof existingDue === "number" &&
-      Math.abs(existingDue - due.getTime()) < 60_000
+      Math.abs(existingDue - due.getTime()) < 60_000 &&
+      typeof existingFirstUnreplied === "number" &&
+      Math.abs(existingFirstUnreplied - firstUnrepliedBuyerMs) < 60_000
     ) {
       return;
     }
 
     await col.updateOne(
       { conversation_id: convId, shop_id: shopId },
-      { $set: { auto_reply_pending: true, auto_reply_due_at: due, updated_at: new Date() } }
+      {
+        $set: {
+          auto_reply_pending: true,
+          auto_reply_due_at: due,
+          first_unreplied_buyer_message_time: new Date(firstUnrepliedBuyerMs),
+          updated_at: new Date(),
+        },
+      }
     );
 
     console.log(
-      `[auto-reply] review: (re-)scheduled conv=${convId} shop=${shopId} due=${due.toISOString()} (${triggerHour}h from last buyer msg)`
+      `[auto-reply] review: (re-)scheduled conv=${convId} shop=${shopId} due=${due.toISOString()} firstUnreplied=${new Date(firstUnrepliedBuyerMs).toISOString()} (${triggerHour}h)`
     );
   } catch (e) {
     console.warn(`[auto-reply] reviewAutoReplySchedule failed conv=${convId}:`, e);
   }
 }
 
-type WebhookMsg = {
-  shop_id: number;
-  conversation_id: string;
-  to_id: number;
-  to_name: string;
-  from_id: number;
-  /** DB sync returns a Date; webhook data may supply a raw ms number. */
-  last_buyer_message_time?: Date | number;
-};
-
-/**
- * Webhook: バイヤーからのメッセージで自動返信を予約、店舗からならキャンセル。
- *
- * スタッフ判定は `from_id === shop_id` では不十分（セラーセンターのサブアカウント
- * 等は `from_id = 個人user_id`）。 DB に保存済みの `customer_id` と `from_id` が
- * 一致したときだけバイヤーからの着信として扱い、それ以外はスタッフ送信と判定する。
- */
-export async function handleAutoReplyOnWebhookMessage(
-  data: WebhookMsg
-): Promise<void> {
-  const { shop_id, conversation_id, from_id } = data;
-  const convId = String(conversation_id);
-
-  const col = await getCollection<{
-    conversation_id: string;
-    shop_id: number;
-    country?: string;
-    customer_id?: number;
-    chat_type?: string;
-    customer_name?: string;
-    last_auto_reply_at?: Date;
-  }>("shopee_conversations");
-
-  const existing = await col.findOne({ conversation_id: convId, shop_id });
-  if (existing?.chat_type === "notification") return;
-
-  const customerId = Number(existing?.customer_id ?? 0);
-  const fromIdNum = Number(from_id);
-
-  // customer_id が未同期 → 判定不能なので保守的に送らない（pending もクリア）
-  if (!Number.isFinite(customerId) || customerId <= 0) {
-    await clearAutoReplySchedule(convId, shop_id);
-    console.warn(
-      `[auto-reply] webhook: skipped (customer_id 未同期) conv=${convId} shop=${shop_id}`
-    );
-    return;
-  }
-
-  // バイヤー以外（shop 本体でもサブアカウントでも）の送信ならスケジュールをキャンセル
-  const isBuyerMessage =
-    Number.isFinite(fromIdNum) && fromIdNum > 0 && fromIdNum === customerId;
-  if (!isBuyerMessage) {
-    await clearAutoReplySchedule(convId, shop_id);
-    return;
-  }
-
-  const existingCountry = existing?.country;
-  const country =
-    (await getShopCountry(shop_id)) ?? existingCountry ?? "SG";
-  const countryKey = String(country).toUpperCase();
-
-  const countries = await getSingletonAutoReplyCountries();
-  const cfg = countries[countryKey];
-  if (!cfg?.enabled || !cfg.template_id?.trim()) return;
-  if (!ObjectId.isValid(cfg.template_id.trim())) return;
-
-  const triggerHour = Math.max(1, Number(cfg.triggerHour) || 1);
-  const due = new Date(Date.now() + triggerHour * 60 * 60 * 1000);
-
-  await col.updateOne(
-    { conversation_id: convId, shop_id },
-    {
-      $set: {
-        auto_reply_pending: true,
-        auto_reply_due_at: due,
-        updated_at: new Date(),
-      },
-    }
-  );
-
-  console.log(
-    `[auto-reply] Scheduled for ${convId} shop=${shop_id} due=${due.toISOString()} (${triggerHour}h)`
-  );
-}
+// handleAutoReplyOnWebhookMessage (削除 2026-08-05): webhook route は
+// syncWebhookConversationFull → reviewAutoReplySchedule 経由になっており、
+// この関数はプロダクション caller ゼロの dead code だった。 かつ `due` を
+// `Date.now() + triggerHour` で計算しており firstUnrepliedBuyerMs 基準の
+// 新設計と不整合。 将来の事故要因を残さないため削除する。
 
 export type ProcessAutoReplyResult = {
   processed: number;
@@ -635,9 +590,10 @@ async function applyOneShotTemplateFix(): Promise<void> {
 /**
  * フラグに依存しない救済スキャン (auto-reply 漏れ防止セーフティネット)。
  *
- * 通常は webhook (handleAutoReplyOnWebhookMessage) / sync (scheduleAutoReplyForUnread) /
- * chats-messages の review が `auto_reply_pending=true` をセットするが、 3 経路が
- * 何らかの理由で空振りすると DB に処理対象が存在せず cron は永遠に空回りする
+ * 通常は webhook (syncWebhookConversationFull → reviewAutoReplySchedule) /
+ * sync (scheduleAutoReplyForUnread) / chats-messages の review が
+ * `auto_reply_pending=true` をセットするが、 3 経路が何らかの理由で空振りすると
+ * DB に処理対象が存在せず cron は永遠に空回りする
  * (2026-05-15 観察 — pending_total=0 で cron が processed=0 を返し続ける状態)。
  *
  * 本スキャンは最後の砦として直近 24h の buyer 着信を網羅的に拾い、 staff 応答
@@ -662,6 +618,8 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
     customer_id?: number;
     chat_type?: string;
     last_message_time?: Date | null;
+    last_buyer_message_time?: Date | null;
+    first_unreplied_buyer_message_time?: Date | null;
     last_auto_reply_at?: Date | null;
     auto_reply_pending?: boolean;
   }>("shopee_conversations");
@@ -709,7 +667,15 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
     }
 
     const triggerHour = Math.max(1, Number(cfg.triggerHour) || 1);
-    const dueMs = lmt.getTime() + triggerHour * 60 * 60 * 1000;
+    // ペナルティ 12h 起算点は「最初の未返信 buyer msg」。 raw 経由の review が
+    // populate した first_unreplied_buyer_message_time があれば最優先。 無ければ
+    // last_buyer_message_time → last_message_time の順に fallback (fallback は
+    // 連投で due が後退する可能性があるが、 process → review 経由で自然補正)。
+    const baseMs =
+      doc.first_unreplied_buyer_message_time?.getTime?.() ??
+      doc.last_buyer_message_time?.getTime?.() ??
+      lmt.getTime();
+    const dueMs = baseMs + triggerHour * 60 * 60 * 1000;
     const nowMs = Date.now();
     const due = new Date(dueMs > nowMs ? dueMs : nowMs);
 
@@ -728,7 +694,7 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
     result.rescued++;
     console.log(
       `[auto-reply] rescue: flagged conv=${doc.conversation_id} shop=${doc.shop_id} ` +
-        `lmt=${lmt.toISOString()} due=${due.toISOString()}`
+        `base=${new Date(baseMs).toISOString()} due=${due.toISOString()}`
     );
   }
 

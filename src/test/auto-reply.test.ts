@@ -176,7 +176,58 @@ describe("classifyShopeeMessageSender", () => {
 describe("computeBuyerStaffLastMs", () => {
   it("returns zeros for an empty list", () => {
     const r = computeBuyerStaffLastMs([], CUSTOMER_ID);
-    expect(r).toEqual({ lastBuyerMs: 0, lastStaffMs: 0 });
+    expect(r).toEqual({
+      lastBuyerMs: 0,
+      lastStaffMs: 0,
+      firstUnrepliedBuyerMs: 0,
+    });
+  });
+
+  // firstUnrepliedBuyerMs: staff 未返信のみ → 最古の buyer msg
+  it("firstUnrepliedBuyerMs = oldest buyer when no staff replies (connect-back regression)", () => {
+    const first = 1_700_000_000_000;
+    const second = first + 3 * 3600_000;
+    const third = second + 5 * 3600_000;
+    const r = computeBuyerStaffLastMs(
+      [msg(CUSTOMER_ID, first), msg(CUSTOMER_ID, second), msg(CUSTOMER_ID, third)],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(third);
+    expect(r.firstUnrepliedBuyerMs).toBe(first);
+    expect(r.lastStaffMs).toBe(0);
+  });
+
+  // firstUnrepliedBuyerMs: staff 返信 → その後の buyer msg → 最古 (staff 直後の) buyer
+  it("firstUnrepliedBuyerMs = oldest buyer AFTER last staff reply", () => {
+    const t1 = 1_700_000_000_000;         // buyer #1 (replied by staff)
+    const t2 = t1 + 1 * 3600_000;         // staff replies
+    const t3 = t2 + 2 * 3600_000;         // buyer #2 (UNREPLIED, this is the trigger)
+    const t4 = t3 + 4 * 3600_000;         // buyer #3 (later, but t3 is the oldest unreplied)
+    const r = computeBuyerStaffLastMs(
+      [
+        msg(CUSTOMER_ID, t1),
+        msg(SHOP_ID, t2),
+        msg(CUSTOMER_ID, t3),
+        msg(CUSTOMER_ID, t4),
+      ],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(t4);
+    expect(r.lastStaffMs).toBe(t2);
+    expect(r.firstUnrepliedBuyerMs).toBe(t3);
+  });
+
+  // firstUnrepliedBuyerMs: staff が全 buyer より新しい → 0 (未返信なし)
+  it("firstUnrepliedBuyerMs = 0 when staff replied after all buyer messages", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 1 * 3600_000;
+    const t3 = t2 + 1 * 3600_000; // staff is latest
+    const r = computeBuyerStaffLastMs(
+      [msg(CUSTOMER_ID, t1), msg(CUSTOMER_ID, t2), msg(SHOP_ID, t3)],
+      CUSTOMER_ID
+    );
+    expect(r.lastStaffMs).toBeGreaterThanOrEqual(r.lastBuyerMs);
+    expect(r.firstUnrepliedBuyerMs).toBe(0);
   });
 
   it("toyota_seg reproduction: buyer / shop / buyer / sub-account staff", () => {
@@ -857,6 +908,102 @@ describe("reviewAutoReplySchedule", () => {
     // due は M(2h前)+11h ≈ 9h future、 stale last_message_time 由来ではない
     expect(diffH).toBeGreaterThan(8.5);
     expect(diffH).toBeLessThan(9.5);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Case 14 (ayekzulfan 回帰): 連投 buyer msg で due が後退しないこと。
+  // Shopee 応答率ペナルティは「最初の未返信 buyer msg + 12h」で起算されるため、
+  // due は firstUnrepliedBuyerMs 基準でなくてはならない。
+  // ---------------------------------------------------------------------------
+  it("Case 14 (ayekzulfan regression): due anchored to FIRST unreplied buyer, not the latest", async () => {
+    const first = hoursAgo(7);         // 1通目 未返信 (ペナルティ起算点)
+    const second = hoursAgo(0.5);       // 連投 30 分前
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv_connect_back",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [msg(CUSTOMER_ID, first), msg(CUSTOMER_ID, second)],
+      SHOP_ID,
+      "conv_connect_back"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    // due should be firstUnrepliedBuyer(first) + 11h、 NOT second + 11h。
+    // first + 11h から現在時刻までの残り時間は 11 - 7 = 4h。
+    const due = update.$set.auto_reply_due_at as Date;
+    const remainingH = (due.getTime() - Date.now()) / 3600_000;
+    expect(remainingH).toBeGreaterThan(3.5);
+    expect(remainingH).toBeLessThan(4.5);
+    // first_unreplied_buyer_message_time also populated to first (older) msg
+    // (msg() helper が sec 精度で丸めるので同じ丸めで比較)
+    const firstUnreplied = update.$set
+      .first_unreplied_buyer_message_time as Date;
+    expect(firstUnreplied.getTime()).toBe(Math.floor(first / 1000) * 1000);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Case 15: staff replied → new buyer msg → firstUnreplied resets to new buyer
+  // ---------------------------------------------------------------------------
+  it("Case 15: firstUnreplied resets after staff replies + new buyer msg", async () => {
+    const t1 = hoursAgo(20); // buyer #1 (replied)
+    const t2 = hoursAgo(18); // staff reply
+    const t3 = hoursAgo(6);  // buyer #2 (UNREPLIED, this is the trigger)
+    mockCollection.findOne.mockImplementation(async (filter: Record<string, unknown>) => {
+      if (filter._id === "singleton") {
+        return {
+          countries: {
+            SG: { enabled: true, triggerHour: 11, template_id: TEMPLATE_ID },
+          },
+        };
+      }
+      return {
+        conversation_id: "conv_reset",
+        shop_id: SHOP_ID,
+        country: "SG",
+        customer_id: CUSTOMER_ID,
+        auto_reply_pending: false,
+        auto_reply_due_at: null,
+        last_auto_reply_at: null,
+      };
+    });
+
+    await reviewAutoReplySchedule(
+      [
+        msg(CUSTOMER_ID, t1),
+        msg(SHOP_ID, t2),
+        msg(CUSTOMER_ID, t3),
+      ],
+      SHOP_ID,
+      "conv_reset"
+    );
+
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    // firstUnreplied = t3 (buyer #2), due = t3 + 11h → 5h future
+    const due = update.$set.auto_reply_due_at as Date;
+    const remainingH = (due.getTime() - Date.now()) / 3600_000;
+    expect(remainingH).toBeGreaterThan(4.5);
+    expect(remainingH).toBeLessThan(5.5);
+    const firstUnreplied = update.$set
+      .first_unreplied_buyer_message_time as Date;
+    expect(firstUnreplied.getTime()).toBe(Math.floor(t3 / 1000) * 1000);
   });
 });
 
