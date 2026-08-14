@@ -35,10 +35,15 @@ import {
   classifyShopeeMessageSender,
   computeBuyerStaffLastMs,
   computeLastAnyMessageMs,
+  computeLastNonSystemActivityMs,
+  HUMAN_REPLY_MIN_INTERVAL_MS,
+  looksLikeSystemGeneratedMessage,
+  MAX_SEND_RETRY,
+  processDueAutoReplies,
   reviewAutoReplySchedule,
   scheduleAutoReplyForUnread,
 } from "@/lib/auto-reply";
-import { fetchAllConversationMessages } from "@/lib/shopee-api";
+import { fetchAllConversationMessages, sendMessage } from "@/lib/shopee-api";
 
 // ---------------------------------------------------------------------------
 // Shared test fixtures
@@ -1092,5 +1097,448 @@ describe("scheduleAutoReplyForUnread — coverage window filter", () => {
     expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
     const [, update] = mockCollection.updateOne.mock.calls[0];
     expect(update.$set.auto_reply_pending).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Fix A (2026-08-14): looksLikeSystemGeneratedMessage
+// ===========================================================================
+describe("looksLikeSystemGeneratedMessage (Fix A)", () => {
+  const KNOWN_CARDS = [
+    "logistics_card",
+    "new_faq",
+    "faq_liveagent_prompt",
+    "faq_card",
+    "return_refund_card",
+    "out_of_stock_reminder_card",
+    "auto_reply",
+    "delivery_notification",
+  ];
+
+  for (const t of KNOWN_CARDS) {
+    it(`known system card "${t}" → true`, () => {
+      expect(looksLikeSystemGeneratedMessage({ message_type: t })).toBe(true);
+      // case-insensitive
+      expect(
+        looksLikeSystemGeneratedMessage({ message_type: t.toUpperCase() })
+      ).toBe(true);
+    });
+  }
+
+  it("pattern _card → true (unknown _card variants)", () => {
+    expect(
+      looksLikeSystemGeneratedMessage({ message_type: "some_new_unknown_card" })
+    ).toBe(true);
+  });
+
+  it("pattern _notification → true", () => {
+    expect(
+      looksLikeSystemGeneratedMessage({ message_type: "shipping_notification" })
+    ).toBe(true);
+  });
+
+  it("pattern _prompt → true", () => {
+    expect(
+      looksLikeSystemGeneratedMessage({ message_type: "helpful_prompt" })
+    ).toBe(true);
+  });
+
+  it("pattern _reminder → true", () => {
+    expect(
+      looksLikeSystemGeneratedMessage({ message_type: "renewal_reminder" })
+    ).toBe(true);
+  });
+
+  it("pattern system_ (prefix) → true", () => {
+    expect(
+      looksLikeSystemGeneratedMessage({ message_type: "system_message" })
+    ).toBe(true);
+  });
+
+  it("plain text message_type=text → false", () => {
+    expect(looksLikeSystemGeneratedMessage({ message_type: "text" })).toBe(false);
+  });
+
+  it("sticker message → false (real human interaction)", () => {
+    expect(looksLikeSystemGeneratedMessage({ message_type: "sticker" })).toBe(
+      false
+    );
+  });
+
+  it("order card (buyer-initiated) → false (not a system-generated reply)", () => {
+    expect(looksLikeSystemGeneratedMessage({ message_type: "order" })).toBe(
+      false
+    );
+  });
+
+  it("item card → false", () => {
+    expect(looksLikeSystemGeneratedMessage({ message_type: "item" })).toBe(
+      false
+    );
+  });
+
+  it("empty message_type → false", () => {
+    expect(looksLikeSystemGeneratedMessage({})).toBe(false);
+    expect(looksLikeSystemGeneratedMessage({ message_type: "" })).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Fix A integration: classifyShopeeMessageSender で system card は "unknown" になる
+// ===========================================================================
+describe("classifyShopeeMessageSender (Fix A: system card → unknown)", () => {
+  it("logistics_card with from_id=0 to_id=customer (would be Patch A staff) → unknown", () => {
+    expect(
+      classifyShopeeMessageSender(
+        {
+          message_type: "logistics_card",
+          from_id: 0,
+          to_id: CUSTOMER_ID,
+        },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("logistics_card with from_id=shop_id (traditional staff) → unknown", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "logistics_card", from_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("new_faq → unknown", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "new_faq", from_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("plain text with from_id=shop_id → staff (real reply, unchanged)", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "text", from_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("staff");
+  });
+});
+
+// ===========================================================================
+// Fix B (2026-08-14): 30秒近接ガード in computeBuyerStaffLastMs
+// ===========================================================================
+describe("computeBuyerStaffLastMs (Fix B: 30s proximity guard)", () => {
+  it("staff msg 29s after buyer → treated as system (lastStaffMs stays 0)", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 29 * 1000;
+    const r = computeBuyerStaffLastMs(
+      [msg(CUSTOMER_ID, t1), msg(SHOP_ID, t2)],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(t1);
+    expect(r.lastStaffMs).toBe(0); // proximity guard filtered
+    expect(r.firstUnrepliedBuyerMs).toBe(t1);
+  });
+
+  it("staff msg 31s after buyer → real staff (lastStaffMs set)", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 31 * 1000;
+    const r = computeBuyerStaffLastMs(
+      [msg(CUSTOMER_ID, t1), msg(SHOP_ID, t2)],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(t1);
+    expect(r.lastStaffMs).toBe(t2);
+    expect(r.firstUnrepliedBuyerMs).toBe(0); // staff replied after buyer
+  });
+
+  it("exactly at threshold (30s) → still filtered (strict <)", () => {
+    // 「未満」判定なので 30_000ms ちょうどは staff としてカウント
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + HUMAN_REPLY_MIN_INTERVAL_MS;
+    const r = computeBuyerStaffLastMs(
+      [msg(CUSTOMER_ID, t1), msg(SHOP_ID, t2)],
+      CUSTOMER_ID
+    );
+    expect(r.lastStaffMs).toBe(t2);
+  });
+
+  it("multiple buyer + fast system reply + slow real staff → mixed correct", () => {
+    // msg() helper が sec 精度で丸めるので、 各 msg は 1s 単位で分離する
+    const buyer1 = 1_700_000_000_000;
+    const buyer2 = buyer1 + 1000; // 1s later
+    const systemReply = buyer2 + 5000; // 5s after buyer2 (< 30s → proximity filter)
+    const realStaff = buyer2 + 60_000; // 60s after buyer2 (> 30s → real staff)
+    const r = computeBuyerStaffLastMs(
+      [
+        msg(CUSTOMER_ID, buyer1),
+        msg(CUSTOMER_ID, buyer2),
+        msg(SHOP_ID, systemReply), // Fix B filter
+        msg(SHOP_ID, realStaff),   // real staff
+      ],
+      CUSTOMER_ID
+    );
+    expect(r.lastBuyerMs).toBe(buyer2);
+    expect(r.lastStaffMs).toBe(realStaff);
+  });
+
+  it("no prior buyer → staff not filtered by proximity (first msg is staff)", () => {
+    const t1 = 1_700_000_000_000;
+    const r = computeBuyerStaffLastMs([msg(SHOP_ID, t1)], CUSTOMER_ID);
+    expect(r.lastStaffMs).toBe(t1);
+    expect(r.lastBuyerMs).toBe(0);
+  });
+
+  it("yonghuing regression: buyer + buyer + [logistics_card] 1s later → auto-reply must fire", () => {
+    // 08-13 17:30:01 buyer order
+    // 08-13 17:30:02 buyer text
+    // 08-13 17:30:03 staff [logistics_card] (1s after)
+    const t1 = 1_723_534_201_000; // 2024-08-13 17:30:01 (arbitrary anchor)
+    const t2 = t1 + 1000;
+    const t3 = t1 + 2000;
+    const r = computeBuyerStaffLastMs(
+      [
+        { from_id: 0, to_id: SHOP_ID, message_type: "order", timestamp: Math.floor(t1 / 1000) },
+        msg(CUSTOMER_ID, t2),
+        // [logistics_card] = system card ALSO from shop-side. Fix A の system 除外が
+        // 効くので from_id は shop_id にしておく (実 Shopee 挙動と同等)。
+        { from_id: SHOP_ID, message_type: "logistics_card", timestamp: Math.floor(t3 / 1000) },
+      ],
+      CUSTOMER_ID,
+      SHOP_ID
+    );
+    // Fix A: [logistics_card] is system → lastStaffMs stays 0
+    // Fix B (redundant defense): even if Fix A missed, 1s < 30s → still filtered
+    expect(r.lastStaffMs).toBe(0);
+    expect(r.lastBuyerMs).toBe(t2);
+    // firstUnreplied = earliest unreplied buyer = t1 (order card)
+    // Note: order card via Patch D (from_id=0 + to_id=shop_id) → classified as buyer
+    expect(r.firstUnrepliedBuyerMs).toBe(t1);
+  });
+});
+
+// ===========================================================================
+// Fix D (2026-08-14): computeLastNonSystemActivityMs - Patch C 用の system 除外版
+// ===========================================================================
+describe("computeLastNonSystemActivityMs (Fix D)", () => {
+  it("excludes known system cards from lastAny", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 60 * 1000;
+    const t3 = t2 + 60 * 1000;
+    const r = computeLastNonSystemActivityMs(
+      [
+        msg(CUSTOMER_ID, t1),
+        msg(SHOP_ID, t2), // real staff
+        { message_type: "logistics_card", from_id: SHOP_ID, timestamp: Math.floor(t3 / 1000) },
+      ],
+      CUSTOMER_ID,
+      SHOP_ID
+    );
+    // t3 (system card) excluded → last non-system = t2
+    expect(r).toBe(t2);
+  });
+
+  it("excludes proximity-filtered staff msgs (Fix B integration)", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 5 * 1000; // 5s after (proximity-filtered)
+    const r = computeLastNonSystemActivityMs(
+      [msg(CUSTOMER_ID, t1), msg(SHOP_ID, t2)],
+      CUSTOMER_ID,
+      SHOP_ID
+    );
+    // t2 filtered by proximity → last non-system = t1
+    expect(r).toBe(t1);
+  });
+
+  it("includes real staff activity", () => {
+    const t1 = 1_700_000_000_000;
+    const t2 = t1 + 60 * 60 * 1000; // 1h later
+    const r = computeLastNonSystemActivityMs(
+      [msg(CUSTOMER_ID, t1), msg(SHOP_ID, t2)],
+      CUSTOMER_ID
+    );
+    expect(r).toBe(t2);
+  });
+
+  it("empty list → 0", () => {
+    expect(computeLastNonSystemActivityMs([], CUSTOMER_ID)).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Fix E (2026-08-14): send failure retry + GIVE UP log
+// ===========================================================================
+describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
+  const mockedFetch = vi.mocked(fetchAllConversationMessages);
+  const mockedSend = vi.mocked(sendMessage);
+
+  beforeEach(() => {
+    mockCollection.findOne.mockReset();
+    mockCollection.updateOne.mockReset();
+    mockCollection.find.mockReset();
+    mockCollection.findOneAndUpdate.mockReset();
+    mockedFetch.mockReset();
+    mockedSend.mockReset();
+  });
+
+  function setupSendFailScenario(currentRetryCount: number) {
+    // Buyer msg 12h ago, well past 8h triggerHour
+    const buyerMsgMs = hoursAgo(12);
+
+    // outer find returns the due doc
+    mockCollection.find.mockReturnValue({
+      limit: () => ({
+        toArray: async () => [
+          {
+            conversation_id: "conv_fail",
+            shop_id: SHOP_ID,
+            country: "SG",
+            customer_id: CUSTOMER_ID,
+            auto_reply_pending: true,
+            auto_reply_due_at: new Date(Date.now() - 60_000),
+            auto_reply_retry_count: currentRetryCount,
+            last_auto_reply_at: null,
+          },
+        ],
+      }),
+    } as unknown as ReturnType<typeof mockCollection.find>);
+
+    mockCollection.findOne.mockImplementation(
+      async (filter: Record<string, unknown>) => {
+        if (filter._id === "singleton") {
+          return {
+            _id: "singleton",
+            template_fix_applied: true,
+            countries: {
+              SG: { enabled: true, triggerHour: 8, template_id: TEMPLATE_ID },
+            },
+          };
+        }
+        // conversation lookup (existing check in review)
+        if (filter.conversation_id === "conv_fail") {
+          return {
+            conversation_id: "conv_fail",
+            shop_id: SHOP_ID,
+            country: "SG",
+            customer_id: CUSTOMER_ID,
+            auto_reply_pending: true,
+            auto_reply_due_at: new Date(Date.now() - 60_000),
+            auto_reply_retry_count: currentRetryCount,
+            last_auto_reply_at: null,
+          };
+        }
+        // reply_templates fallback
+        return {
+          _id: "any",
+          content: "Test template content",
+          autoReply: true,
+          updated_at: new Date(),
+        };
+      }
+    );
+
+    // Claim succeeds (pending was true, due past)
+    mockCollection.findOneAndUpdate.mockResolvedValue({
+      conversation_id: "conv_fail",
+      shop_id: SHOP_ID,
+    });
+
+    mockedFetch.mockResolvedValue([msg(CUSTOMER_ID, buyerMsgMs)]);
+  }
+
+  it("first send failure → pending preserved, retry_count incremented, [retry pending] log", async () => {
+    setupSendFailScenario(0);
+    mockedSend.mockRejectedValue(new Error("Shopee API 5xx transient"));
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await processDueAutoReplies();
+
+    expect(result.sent).toBe(0);
+    expect(result.errors.length).toBe(1);
+
+    // find last updateOne call — should set retry_count=1, NOT clear pending
+    const calls = mockCollection.updateOne.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    const updateArg = lastCall[1] as { $set: Record<string, unknown> };
+    expect(updateArg.$set.auto_reply_retry_count).toBe(1);
+    expect(updateArg.$set.auto_reply_pending).toBeUndefined();
+    expect(updateArg.$set.auto_reply_due_at).toBeUndefined();
+
+    // Confirm [retry pending] warning fired
+    const retryWarnCall = warnSpy.mock.calls.find((c) =>
+      String(c[0] ?? "").includes("[auto-reply] retry pending")
+    );
+    expect(retryWarnCall).toBeTruthy();
+    expect(String(retryWarnCall![0])).toContain("retry=1/5");
+
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it("5th send failure → GIVE UP log, pending cleared, retry_count reset, gave_up_at set", async () => {
+    setupSendFailScenario(MAX_SEND_RETRY - 1); // 4回目まで retry 済、 5回目で give up
+    mockedSend.mockRejectedValue(new Error("Shopee permanent error"));
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await processDueAutoReplies();
+
+    expect(result.sent).toBe(0);
+    expect(result.errors.length).toBe(1);
+
+    // updateOne with GIVE UP fields
+    const calls = mockCollection.updateOne.mock.calls;
+    const giveUpCall = calls.find((c) => {
+      const set = (c[1] as { $set?: Record<string, unknown> }).$set;
+      return set?.auto_reply_gave_up_at !== undefined;
+    });
+    expect(giveUpCall).toBeTruthy();
+    const setArg = (giveUpCall![1] as { $set: Record<string, unknown> }).$set;
+    expect(setArg.auto_reply_pending).toBe(false);
+    expect(setArg.auto_reply_due_at).toBe(null);
+    expect(setArg.auto_reply_retry_count).toBe(0);
+    expect(setArg.auto_reply_gave_up_at).toBeInstanceOf(Date);
+    expect(setArg.auto_reply_last_error).toBe("Shopee permanent error");
+
+    // Confirm GIVE UP log format
+    const giveUpLogCall = errSpy.mock.calls.find((c) =>
+      String(c[0] ?? "").includes("[auto-reply] GIVE UP")
+    );
+    expect(giveUpLogCall).toBeTruthy();
+    const logMsg = String(giveUpLogCall![0]);
+    expect(logMsg).toContain("conv=conv_fail");
+    expect(logMsg).toContain(`shop=${SHOP_ID}`);
+    expect(logMsg).toContain(`retry=${MAX_SEND_RETRY}`);
+    expect(logMsg).toContain("reason=Shopee permanent error");
+
+    errSpy.mockRestore();
+  });
+
+  it("successful send resets retry_count to 0", async () => {
+    setupSendFailScenario(2); // 2回失敗した後の成功
+    mockedSend.mockResolvedValue({ error: "", message: "ok", response: {} });
+
+    await processDueAutoReplies();
+
+    // Look for the success-path updateOne (sets last_auto_reply_at)
+    const calls = mockCollection.updateOne.mock.calls;
+    const successCall = calls.find((c) => {
+      const set = (c[1] as { $set?: Record<string, unknown> }).$set;
+      return set?.last_auto_reply_at instanceof Date;
+    });
+    expect(successCall).toBeTruthy();
+    const setArg = (successCall![1] as { $set: Record<string, unknown> }).$set;
+    expect(setArg.auto_reply_retry_count).toBe(0);
+    expect(setArg.handling_status).toBe("auto_replied_pending");
   });
 });

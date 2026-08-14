@@ -9,6 +9,54 @@ import {
 import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
 
 /**
+ * Fix A (2026-08-14): Shopee 側が自動生成するシステムカードを検出する。
+ *
+ * yonghuing 案件: buyer msg の 1 秒後に [logistics_card] が staff 側で着弾し
+ * "cleared (staff replied)" ブランチで pending がクリアされていた。 これらの
+ * カードは Shopee がバイヤーの質問に自動応答するシステムメッセージであり、
+ * 販売者の返信ではないため、 応答率ペナルティの起算点を消してはならない。
+ *
+ * 判定基準:
+ *   1. 既知の message_type (実サンプルから収集) にヒット
+ *   2. パターン (_card / _notification / _prompt / _reminder / system_) にヒット
+ *
+ * 未知の新種カードにも一定の耐性を持たせるためパターンマッチも併用。
+ */
+const KNOWN_SYSTEM_CARD_TYPES = new Set<string>([
+  "logistics_card",
+  "new_faq",
+  "faq_liveagent_prompt",
+  "faq_card",
+  "return_refund_card",
+  "out_of_stock_reminder_card",
+  "auto_reply",
+  "delivery_notification",
+]);
+
+const SYSTEM_MESSAGE_PATTERN = /(_card|_notification|_prompt|_reminder|^system_)/;
+
+export function looksLikeSystemGeneratedMessage(
+  msg: Record<string, unknown>
+): boolean {
+  const mt = String(msg.message_type ?? msg.type ?? "").toLowerCase();
+  if (!mt) return false;
+  if (KNOWN_SYSTEM_CARD_TYPES.has(mt)) return true;
+  return SYSTEM_MESSAGE_PATTERN.test(mt);
+}
+
+/**
+ * Fix B (2026-08-14): 買い手 msg から HUMAN_REPLY_MIN_INTERVAL_MS 以内に staff-side
+ * で着弾したメッセージは人間の返信ではありえない (通知遅延 + 内容読解 + タイプで
+ * 最低数十秒必要)。 これらは Shopee 側の自動応答と判断し、 staff としてカウント
+ * しない。 未知システムカードにも耐性を持たせるための時間ベース補完。
+ *
+ * 30秒閾値の根拠: 人間の応答は最低でも 30秒+ かかる。 誤除外リスク (真の staff
+ * 高速返信) は極めて低く、 起きても「auto-reply が 1 通多く送られる」だけで
+ * ペナルティ超過より遥かに軽微。
+ */
+export const HUMAN_REPLY_MIN_INTERVAL_MS = 30_000;
+
+/**
  * Pure helper (testable): classify a single Shopee chat message as buyer vs. staff.
  *
  * Why not just `from_id === shop_id`:
@@ -42,6 +90,10 @@ export function classifyShopeeMessageSender(
   customerId: number,
   shopId?: number
 ): "buyer" | "staff" | "unknown" {
+  // Fix A: 既知/パターン一致のシステムカードは常に "unknown" (buyer/staff どちらにも
+  // カウントしない → 応答率の起算点を消さない)。 from_id/to_id 判定より優先する。
+  if (looksLikeSystemGeneratedMessage(msg)) return "unknown";
+
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
   const buyer = Number(customerId);
   const shop = Number(shopId ?? 0);
@@ -69,6 +121,61 @@ export function classifyShopeeMessageSender(
 }
 
 /**
+ * Fix B (2026-08-14): メッセージリストを ts 昇順で走査し、 各 msg に精緻化された
+ * kind を付与する:
+ *   - initial "buyer" → "buyer"
+ *   - initial "staff" AND 直前の buyer msg から HUMAN_REPLY_MIN_INTERVAL_MS 未満
+ *     → "system" (Shopee 自動応答扱い、 staff カウント外)
+ *   - initial "staff" AND buyer から充分離れている or 直前 buyer なし → "staff"
+ *   - initial "unknown" → "system" (旧設計は skip して Patch C で拾っていたが、
+ *     新設計「取りこぼしゼロ」では unknown も送信ブロックに使わない)
+ *
+ * 「送るのを止める」判定に使えるのは refined kind が "staff" のものだけ。
+ * "system" は staff/buyer どちらのカウントにも影響しない。
+ */
+type RefinedKind = "buyer" | "staff" | "system";
+type RefinedMessage = { ts: number; kind: RefinedKind };
+
+function refineMessageKinds(
+  rawMessages: Record<string, unknown>[],
+  customerId: number,
+  shopId?: number
+): RefinedMessage[] {
+  const initial = rawMessages.map((msg) => ({
+    ts: shopeeMessageTimeToMs(
+      msg.timestamp ?? msg.created_timestamp ?? msg.time
+    ),
+    initialKind: classifyShopeeMessageSender(msg, customerId, shopId),
+  }));
+  initial.sort((a, b) => a.ts - b.ts);
+
+  const refined: RefinedMessage[] = [];
+  let lastBuyerTs = 0;
+  for (const item of initial) {
+    let kind: RefinedKind;
+    if (item.initialKind === "buyer") {
+      kind = "buyer";
+      lastBuyerTs = item.ts;
+    } else if (item.initialKind === "staff") {
+      if (
+        lastBuyerTs > 0 &&
+        item.ts - lastBuyerTs < HUMAN_REPLY_MIN_INTERVAL_MS
+      ) {
+        // Fix B: 直前 buyer msg から近すぎる → 人間返信ではない (システム自動応答)
+        kind = "system";
+      } else {
+        kind = "staff";
+      }
+    } else {
+      // Fix A/D 統合: unknown は system 扱いにする (送信ブロックしない)
+      kind = "system";
+    }
+    refined.push({ ts: item.ts, kind });
+  }
+  return refined;
+}
+
+/**
  * Pure helper (testable): walk raw messages and return the latest buyer/staff
  * timestamps (ms since epoch, 0 if none) plus the *first unreplied* buyer
  * message timestamp.
@@ -80,27 +187,27 @@ export function classifyShopeeMessageSender(
  *   - staff 未返信 (lastStaffMs=0): 全 buyer msg が対象 → 最古の buyer msg
  *   - staff が全 buyer より新しい (lastStaffMs >= lastBuyerMs): 未返信なし → 0
  *   - 途中 staff 返信 → 続く buyer 発信: staff 以降の最古 buyer msg
+ *
+ * Fix A+B (2026-08-14) 以降: system 判定された msg (既知カード / パターン一致 /
+ * 30秒近接ガード / 分類不能) は lastStaffMs 計算から除外される。
  */
 export function computeBuyerStaffLastMs(
   rawMessages: Record<string, unknown>[],
   customerId: number,
   shopId?: number
 ): { lastBuyerMs: number; lastStaffMs: number; firstUnrepliedBuyerMs: number } {
+  const refined = refineMessageKinds(rawMessages, customerId, shopId);
   let lastBuyerMs = 0;
   let lastStaffMs = 0;
   const buyerTimestamps: number[] = [];
-  for (const msg of rawMessages) {
-    const kind = classifyShopeeMessageSender(msg, customerId, shopId);
-    if (kind === "unknown") continue;
-    const ts = shopeeMessageTimeToMs(
-      msg.timestamp ?? msg.created_timestamp ?? msg.time
-    );
-    if (kind === "buyer") {
-      buyerTimestamps.push(ts);
-      if (ts > lastBuyerMs) lastBuyerMs = ts;
-    } else {
-      if (ts > lastStaffMs) lastStaffMs = ts;
+  for (const m of refined) {
+    if (m.kind === "buyer") {
+      buyerTimestamps.push(m.ts);
+      if (m.ts > lastBuyerMs) lastBuyerMs = m.ts;
+    } else if (m.kind === "staff") {
+      if (m.ts > lastStaffMs) lastStaffMs = m.ts;
     }
+    // system: 集計から除外
   }
   let firstUnrepliedBuyerMs = 0;
   for (const ts of buyerTimestamps) {
@@ -113,11 +220,10 @@ export function computeBuyerStaffLastMs(
 
 /**
  * Pure helper (testable): return the latest message timestamp (ms) regardless
- * of sender classification.
+ * of sender classification. 旧 Patch C の per-tick 判定用に維持 (テスト後方互換)。
  *
- * Patch C 用: 「from_id=0 / to_id 0 で sender が "unknown" になったメッセージ」
- * も含めた最終時刻を取得する。 pre-send guard で「最後に分類できた buyer
- * メッセージより新しい未分類活動があれば送らない」二重防衛に使用する。
+ * ⚠ 新規コードは代わりに `computeLastNonSystemActivityMs` を使うこと (システム
+ * カードと proximity 近接 staff を除外し「取りこぼしゼロ」設計に沿う)。
  */
 export function computeLastAnyMessageMs(
   rawMessages: Record<string, unknown>[]
@@ -128,6 +234,28 @@ export function computeLastAnyMessageMs(
       msg.timestamp ?? msg.created_timestamp ?? msg.time
     );
     if (ts > last) last = ts;
+  }
+  return last;
+}
+
+/**
+ * Fix D (2026-08-14): Patch C 用の system 除外版 lastAny。 system 判定された
+ * メッセージ (既知カード / パターン一致 / 30秒近接 staff / 分類不能) を除外して、
+ * 「buyer msg より新しい非システム活動」を検出する。
+ *
+ * 旧 computeLastAnyMessageMs は全 msg を含んでいたため、 [logistics_card] のような
+ * システムカードで Patch C が誤発火していた。 これを filter する。
+ */
+export function computeLastNonSystemActivityMs(
+  rawMessages: Record<string, unknown>[],
+  customerId: number,
+  shopId?: number
+): number {
+  const refined = refineMessageKinds(rawMessages, customerId, shopId);
+  let last = 0;
+  for (const m of refined) {
+    if (m.kind === "system") continue;
+    if (m.ts > last) last = m.ts;
   }
   return last;
 }
@@ -534,6 +662,11 @@ export type RescueAutoReplyResult = {
 const MAX_BATCH = 30;
 const RESCUE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const RESCUE_MAX_BATCH = 100;
+/**
+ * Fix E (2026-08-14): sendMessage 失敗時の retry 上限。 到達で GIVE UP ログ + pending クリア。
+ * 5 回 = 15分tick × 5 = 75分 window。 一時 API 障害の吸収と、 恒久エラーでの無限ループ防止のバランス。
+ */
+export const MAX_SEND_RETRY = 5;
 
 /**
  * 一回限りの緊急テンプレID修正 (2026-05-19 / template content empty/missing 復旧)。
@@ -748,6 +881,7 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     customer_id: number;
     auto_reply_pending?: boolean;
     auto_reply_due_at?: Date | null;
+    auto_reply_retry_count?: number;
     last_auto_reply_at?: Date | null;
     chat_type?: string;
     last_message_time?: Date | null;
@@ -932,22 +1066,24 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
      * で完全に無視される。 staff が送った sticker / 特殊メッセージがこれに該当した
      * 場合、guardStaffMs が 0 のままで上のガードを通過してしまう。
      *
-     * 二重防衛として「最後に判定できた buyer メッセージより新しい raw メッセージが
-     * 1 件でも存在するなら、未分類でも何らかの直近活動があるとみなして送信を見送る」。
-     * 4/22 09:10 の sabara2722 / dareraru 誤発火パターンに対する最終セーフティネット。
+     * 「最後に判定できた buyer メッセージより新しい非システム活動が 1 件でも
+     *  存在するなら送信を見送る」。
      *
-     * 副作用: 真の system card (from_id=0 to_id=0) が buyer の後に挟まると
-     * 不必要にスキップする可能性がある。だが「誤送信 > 送信漏れ」の方針に沿う。
-     *
-     * no-signal fallback (2026-05-19) と組み合わせる時は effectiveBuyerMs を基準にする。
-     * fallback で last_message_time を採用した場合でも、 rawList に新しい未分類活動が
-     * あれば Patch C で再度シャットダウンされるため誤発火しない。
+     * Fix D (2026-08-14): 旧 computeLastAnyMessageMs は全 msg を含んでいたため、
+     * [logistics_card] 等の Shopee 自動生成カードが「未分類活動」として誤発火し
+     * yonghuing 案件で auto-reply がブロックされていた。 computeLastNonSystemActivityMs
+     * に切替: 既知カード / パターン一致 / 30秒近接 staff / 分類不能 は除外し、
+     * 「取りこぼしゼロ」原則に沿う (誤送信 1通 < ペナルティ超過 の非対称性を前提)。
      */
-    const lastAnyMs = computeLastAnyMessageMs(rawList);
+    const lastAnyMs = computeLastNonSystemActivityMs(
+      rawList,
+      customerIdNum,
+      shopId
+    );
     if (lastAnyMs > effectiveBuyerMs) {
       await clearAutoReplySchedule(convId, shopId);
       console.log(
-        `[auto-reply] pre-send guard (Patch C): cancelled (unclassified activity after lastBuyer) ` +
+        `[auto-reply] pre-send guard (Patch C): cancelled (non-system activity after lastBuyer) ` +
           `conv=${convId} shop=${shopId} ` +
           `lastAny=${new Date(lastAnyMs).toISOString()} ` +
           `effectiveBuyer=${new Date(effectiveBuyerMs).toISOString()}`
@@ -1037,6 +1173,7 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
             unread_count: 0,
             last_auto_reply_at: new Date(),
             handling_status: "auto_replied_pending",
+            auto_reply_retry_count: 0,
             updated_at: new Date(),
           },
         }
@@ -1048,17 +1185,58 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       const msg = e instanceof Error ? e.message : String(e);
       result.errors.push({ conversation_id: convId, error: msg });
       console.error(`[auto-reply] Failed ${convId}:`, e);
+
+      /**
+       * Fix E (2026-08-14): 旧実装は catch で無条件に pending=false にしていたため、
+       * ネットワーク瞬断など 1 回の失敗で永久停止していた (「取りこぼしゼロ」原則違反)。
+       * 新実装は auto_reply_retry_count で MAX_SEND_RETRY まで pending を保持し、
+       * 次tick 以降 rescue+process の自然サイクルで再送。 上限到達で明示 GIVE UP。
+       *
+       * MAX_SEND_RETRY=5 (75分 window)。 恒久エラー (customer_id 不整合 / Shopee 側
+       * permanent reject 等) は他ガードで捕捉されるので、 send catch 到達は
+       * 主に一時的失敗 (5xx / タイムアウト / rate limit) と想定。
+       *
+       * GIVE UP ログは Chatwork 通知等の外部監視対象にできるよう明確な形式で出力。
+       */
       try {
-        await col.updateOne(
-          { conversation_id: convId, shop_id: shopId },
-          {
-            $set: {
-              auto_reply_pending: false,
-              auto_reply_due_at: null,
-              updated_at: new Date(),
-            },
-          }
+        const currentRetry = Number(
+          (doc as { auto_reply_retry_count?: number }).auto_reply_retry_count ?? 0
         );
+        const newRetry = currentRetry + 1;
+        if (newRetry >= MAX_SEND_RETRY) {
+          // 上限到達 → 諦めて明示的にログ
+          await col.updateOne(
+            { conversation_id: convId, shop_id: shopId },
+            {
+              $set: {
+                auto_reply_pending: false,
+                auto_reply_due_at: null,
+                auto_reply_retry_count: 0,
+                auto_reply_gave_up_at: new Date(),
+                auto_reply_last_error: msg,
+                updated_at: new Date(),
+              },
+            }
+          );
+          console.error(
+            `[auto-reply] GIVE UP conv=${convId} shop=${shopId} retry=${newRetry} reason=${msg}`
+          );
+        } else {
+          // pending 温存 + retry_count インクリメント。 rescue+process が次tick 再試行。
+          await col.updateOne(
+            { conversation_id: convId, shop_id: shopId },
+            {
+              $set: {
+                auto_reply_retry_count: newRetry,
+                auto_reply_last_error: msg,
+                updated_at: new Date(),
+              },
+            }
+          );
+          console.warn(
+            `[auto-reply] retry pending conv=${convId} shop=${shopId} retry=${newRetry}/${MAX_SEND_RETRY}`
+          );
+        }
       } catch {
         /* ignore */
       }
