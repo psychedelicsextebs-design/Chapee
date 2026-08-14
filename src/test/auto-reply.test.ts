@@ -38,7 +38,8 @@ import {
   computeLastNonSystemActivityMs,
   HUMAN_REPLY_MIN_INTERVAL_MS,
   looksLikeSystemGeneratedMessage,
-  MAX_SEND_RETRY,
+  PENALTY_WINDOW_MS,
+  URGENT_HORIZON_MS,
   processDueAutoReplies,
   reviewAutoReplySchedule,
   scheduleAutoReplyForUnread,
@@ -1374,9 +1375,11 @@ describe("computeLastNonSystemActivityMs (Fix D)", () => {
 });
 
 // ===========================================================================
-// Fix E (2026-08-14): send failure retry + GIVE UP log
+// Fix E' (2026-08-14 期限ベース redesign):
+//   諦める条件は「ペナルティ期限切れ」のみ、 回数では諦めない。
+//   期限内は cron が呼ばれる限り何度でも再試行する。
 // ===========================================================================
-describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
+describe("processDueAutoReplies (Fix E': deadline-based retry + MISSED DEADLINE)", () => {
   const mockedFetch = vi.mocked(fetchAllConversationMessages);
   const mockedSend = vi.mocked(sendMessage);
 
@@ -1389,11 +1392,17 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     mockedSend.mockReset();
   });
 
-  function setupSendFailScenario(currentRetryCount: number) {
-    // Buyer msg 12h ago, well past 8h triggerHour
-    const buyerMsgMs = hoursAgo(12);
+  /**
+   * setup: first_unreplied_buyer_message_time を N h 前に設定した send-fail シナリオ。
+   * PENALTY_WINDOW_MS = 12h との差で「期限内 / 期限超過」を切り替えられる。
+   */
+  function setupSendFailScenario(opts: {
+    firstUnrepliedHoursAgo: number;
+    currentRetryCount?: number;
+  }) {
+    const firstUnreplied = new Date(hoursAgo(opts.firstUnrepliedHoursAgo));
+    const buyerMsgMs = hoursAgo(opts.firstUnrepliedHoursAgo);
 
-    // outer find returns the due doc
     mockCollection.find.mockReturnValue({
       limit: () => ({
         toArray: async () => [
@@ -1404,7 +1413,8 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
             customer_id: CUSTOMER_ID,
             auto_reply_pending: true,
             auto_reply_due_at: new Date(Date.now() - 60_000),
-            auto_reply_retry_count: currentRetryCount,
+            auto_reply_retry_count: opts.currentRetryCount ?? 0,
+            first_unreplied_buyer_message_time: firstUnreplied,
             last_auto_reply_at: null,
           },
         ],
@@ -1422,7 +1432,6 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
             },
           };
         }
-        // conversation lookup (existing check in review)
         if (filter.conversation_id === "conv_fail") {
           return {
             conversation_id: "conv_fail",
@@ -1431,11 +1440,11 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
             customer_id: CUSTOMER_ID,
             auto_reply_pending: true,
             auto_reply_due_at: new Date(Date.now() - 60_000),
-            auto_reply_retry_count: currentRetryCount,
+            auto_reply_retry_count: opts.currentRetryCount ?? 0,
+            first_unreplied_buyer_message_time: firstUnreplied,
             last_auto_reply_at: null,
           };
         }
-        // reply_templates fallback
         return {
           _id: "any",
           content: "Test template content",
@@ -1445,7 +1454,6 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
       }
     );
 
-    // Claim succeeds (pending was true, due past)
     mockCollection.findOneAndUpdate.mockResolvedValue({
       conversation_id: "conv_fail",
       shop_id: SHOP_ID,
@@ -1454,8 +1462,9 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     mockedFetch.mockResolvedValue([msg(CUSTOMER_ID, buyerMsgMs)]);
   }
 
-  it("first send failure → pending preserved, retry_count incremented, [retry pending] log", async () => {
-    setupSendFailScenario(0);
+  it("期限内 (残り4h) の失敗 → pending 温存、 retry_count インクリメント、 GIVE UP せず", async () => {
+    // first_unreplied 8h ago → deadline = +12h = 4h future (残 4h)
+    setupSendFailScenario({ firstUnrepliedHoursAgo: 8, currentRetryCount: 0 });
     mockedSend.mockRejectedValue(new Error("Shopee API 5xx transient"));
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1466,27 +1475,66 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     expect(result.sent).toBe(0);
     expect(result.errors.length).toBe(1);
 
-    // find last updateOne call — should set retry_count=1, NOT clear pending
     const calls = mockCollection.updateOne.mock.calls;
     const lastCall = calls[calls.length - 1];
     const updateArg = lastCall[1] as { $set: Record<string, unknown> };
+    // pending / due_at 変更なし、 retry_count = 1
     expect(updateArg.$set.auto_reply_retry_count).toBe(1);
     expect(updateArg.$set.auto_reply_pending).toBeUndefined();
     expect(updateArg.$set.auto_reply_due_at).toBeUndefined();
+    expect(updateArg.$set.auto_reply_gave_up_at).toBeUndefined();
 
-    // Confirm [retry pending] warning fired
     const retryWarnCall = warnSpy.mock.calls.find((c) =>
       String(c[0] ?? "").includes("[auto-reply] retry pending")
     );
     expect(retryWarnCall).toBeTruthy();
-    expect(String(retryWarnCall![0])).toContain("retry=1/5");
+    expect(String(retryWarnCall![0])).toContain("remaining_h=");
+    // GIVE UP / MISSED DEADLINE ログは出ていない
+    const missedCall = errSpy.mock.calls.find((c) =>
+      String(c[0] ?? "").includes("MISSED DEADLINE")
+    );
+    expect(missedCall).toBeUndefined();
 
     warnSpy.mockRestore();
     errSpy.mockRestore();
   });
 
-  it("5th send failure → GIVE UP log, pending cleared, retry_count reset, gave_up_at set", async () => {
-    setupSendFailScenario(MAX_SEND_RETRY - 1); // 4回目まで retry 済、 5回目で give up
+  it("期限内 (残り30分)、 retry_count=99 でも諦めない (回数は無関係)", async () => {
+    // first_unreplied 11.5h ago → deadline = +12h = 30min future
+    setupSendFailScenario({
+      firstUnrepliedHoursAgo: 11.5,
+      currentRetryCount: 99,
+    });
+    mockedSend.mockRejectedValue(new Error("still failing"));
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await processDueAutoReplies();
+
+    const calls = mockCollection.updateOne.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    const updateArg = lastCall[1] as { $set: Record<string, unknown> };
+    // 期限内 → 100 回目も retry (諦めない)
+    expect(updateArg.$set.auto_reply_retry_count).toBe(100);
+    expect(updateArg.$set.auto_reply_gave_up_at).toBeUndefined();
+
+    // MISSED DEADLINE ログは出ていない
+    const missedCall = errSpy.mock.calls.find((c) =>
+      String(c[0] ?? "").includes("MISSED DEADLINE")
+    );
+    expect(missedCall).toBeUndefined();
+
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it("期限超過 (13h 前 first_unreplied) → MISSED DEADLINE ログ + gave_up_at set + pending クリア", async () => {
+    // first_unreplied 13h ago → deadline = +12h = 1h ago (期限 1h 超過)
+    setupSendFailScenario({
+      firstUnrepliedHoursAgo: 13,
+      currentRetryCount: 7,
+    });
     mockedSend.mockRejectedValue(new Error("Shopee permanent error"));
 
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1496,7 +1544,7 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     expect(result.sent).toBe(0);
     expect(result.errors.length).toBe(1);
 
-    // updateOne with GIVE UP fields
+    // MISSED DEADLINE の updateOne を探す
     const calls = mockCollection.updateOne.mock.calls;
     const giveUpCall = calls.find((c) => {
       const set = (c[1] as { $set?: Record<string, unknown> }).$set;
@@ -1510,27 +1558,104 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     expect(setArg.auto_reply_gave_up_at).toBeInstanceOf(Date);
     expect(setArg.auto_reply_last_error).toBe("Shopee permanent error");
 
-    // Confirm GIVE UP log format
-    const giveUpLogCall = errSpy.mock.calls.find((c) =>
-      String(c[0] ?? "").includes("[auto-reply] GIVE UP")
+    // MISSED DEADLINE ログ形式検証
+    const missedLogCall = errSpy.mock.calls.find((c) =>
+      String(c[0] ?? "").includes("[auto-reply] MISSED DEADLINE")
     );
-    expect(giveUpLogCall).toBeTruthy();
-    const logMsg = String(giveUpLogCall![0]);
+    expect(missedLogCall).toBeTruthy();
+    const logMsg = String(missedLogCall![0]);
     expect(logMsg).toContain("conv=conv_fail");
     expect(logMsg).toContain(`shop=${SHOP_ID}`);
-    expect(logMsg).toContain(`retry=${MAX_SEND_RETRY}`);
+    expect(logMsg).toContain("retry=8"); // 7 + 1
+    expect(logMsg).toContain("deadline=");
+    expect(logMsg).toContain("overdue_min=");
     expect(logMsg).toContain("reason=Shopee permanent error");
 
     errSpy.mockRestore();
   });
 
-  it("successful send resets retry_count to 0", async () => {
-    setupSendFailScenario(2); // 2回失敗した後の成功
+  it("first_unreplied 未populate の場合 → fallback (now+12h 猶予) で retry 継続", async () => {
+    // firstUnrepliedHoursAgo=0 (直近) だが、 意図的に field 未設定にする
+    mockCollection.find.mockReturnValue({
+      limit: () => ({
+        toArray: async () => [
+          {
+            conversation_id: "conv_legacy",
+            shop_id: SHOP_ID,
+            country: "SG",
+            customer_id: CUSTOMER_ID,
+            auto_reply_pending: true,
+            auto_reply_due_at: new Date(Date.now() - 60_000),
+            auto_reply_retry_count: 0,
+            // first_unreplied_buyer_message_time: 意図的に未設定
+            last_auto_reply_at: null,
+          },
+        ],
+      }),
+    } as unknown as ReturnType<typeof mockCollection.find>);
+
+    mockCollection.findOne.mockImplementation(
+      async (filter: Record<string, unknown>) => {
+        if (filter._id === "singleton") {
+          return {
+            _id: "singleton",
+            template_fix_applied: true,
+            countries: {
+              SG: { enabled: true, triggerHour: 8, template_id: TEMPLATE_ID },
+            },
+          };
+        }
+        if (filter.conversation_id === "conv_legacy") {
+          return {
+            conversation_id: "conv_legacy",
+            shop_id: SHOP_ID,
+            country: "SG",
+            customer_id: CUSTOMER_ID,
+            auto_reply_pending: true,
+            auto_reply_due_at: new Date(Date.now() - 60_000),
+            auto_reply_retry_count: 0,
+            last_auto_reply_at: null,
+          };
+        }
+        return {
+          content: "Test template content",
+          autoReply: true,
+          updated_at: new Date(),
+        };
+      }
+    );
+    mockCollection.findOneAndUpdate.mockResolvedValue({
+      conversation_id: "conv_legacy",
+      shop_id: SHOP_ID,
+    });
+    mockedFetch.mockResolvedValue([msg(CUSTOMER_ID, hoursAgo(10))]);
+    mockedSend.mockRejectedValue(new Error("transient"));
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await processDueAutoReplies();
+
+    // fallback で now+12h 猶予 → retry 継続
+    const calls = mockCollection.updateOne.mock.calls;
+    const lastCall = calls[calls.length - 1];
+    const updateArg = lastCall[1] as { $set: Record<string, unknown> };
+    expect(updateArg.$set.auto_reply_retry_count).toBe(1);
+    expect(updateArg.$set.auto_reply_gave_up_at).toBeUndefined();
+
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it("成功送信 → retry_count = 0, gave_up_at = null, last_error = null リセット", async () => {
+    setupSendFailScenario({
+      firstUnrepliedHoursAgo: 8,
+      currentRetryCount: 3,
+    });
     mockedSend.mockResolvedValue({ error: "", message: "ok", response: {} });
 
     await processDueAutoReplies();
 
-    // Look for the success-path updateOne (sets last_auto_reply_at)
     const calls = mockCollection.updateOne.mock.calls;
     const successCall = calls.find((c) => {
       const set = (c[1] as { $set?: Record<string, unknown> }).$set;
@@ -1539,6 +1664,93 @@ describe("processDueAutoReplies (Fix E: send retry + GIVE UP)", () => {
     expect(successCall).toBeTruthy();
     const setArg = (successCall![1] as { $set: Record<string, unknown> }).$set;
     expect(setArg.auto_reply_retry_count).toBe(0);
+    expect(setArg.auto_reply_gave_up_at).toBe(null);
+    expect(setArg.auto_reply_last_error).toBe(null);
     expect(setArg.handling_status).toBe("auto_replied_pending");
+  });
+
+  it("urgentOnly=true 指定 → find filter に first_unreplied <= now-10h が含まれる", async () => {
+    // find が呼ばれた時の filter を capture
+    let capturedFilter: Record<string, unknown> | undefined;
+    mockCollection.find.mockImplementation(
+      (filter: Record<string, unknown>) => {
+        capturedFilter = filter;
+        return {
+          limit: () => ({
+            toArray: async () => [],
+          }),
+        } as unknown as ReturnType<typeof mockCollection.find>;
+      }
+    );
+    mockCollection.findOne.mockImplementation(
+      async (filter: Record<string, unknown>) => {
+        if (filter._id === "singleton") {
+          return { template_fix_applied: true, countries: {} };
+        }
+        return null;
+      }
+    );
+
+    await processDueAutoReplies({ urgentOnly: true });
+
+    expect(capturedFilter).toBeDefined();
+    expect(capturedFilter!.auto_reply_pending).toBe(true);
+    expect(capturedFilter!.first_unreplied_buyer_message_time).toBeDefined();
+    const cutoff = (
+      capturedFilter!.first_unreplied_buyer_message_time as {
+        $lte: Date;
+      }
+    ).$lte;
+    // cutoff は now - (12h - 2h) = now - 10h 付近
+    const expectedCutoffMs = Date.now() - (PENALTY_WINDOW_MS - URGENT_HORIZON_MS);
+    expect(Math.abs(cutoff.getTime() - expectedCutoffMs)).toBeLessThan(5000);
+  });
+
+  it("urgentOnly なし (通常 cron) → filter に first_unreplied 条件は入らない", async () => {
+    let capturedFilter: Record<string, unknown> | undefined;
+    mockCollection.find.mockImplementation(
+      (filter: Record<string, unknown>) => {
+        capturedFilter = filter;
+        return {
+          limit: () => ({ toArray: async () => [] }),
+        } as unknown as ReturnType<typeof mockCollection.find>;
+      }
+    );
+    mockCollection.findOne.mockImplementation(
+      async (filter: Record<string, unknown>) => {
+        if (filter._id === "singleton") {
+          return { template_fix_applied: true, countries: {} };
+        }
+        return null;
+      }
+    );
+
+    await processDueAutoReplies();
+
+    expect(capturedFilter).toBeDefined();
+    expect(capturedFilter!.first_unreplied_buyer_message_time).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// clearAutoReplySchedule (Fix E' 拡張): gave_up_at / last_error / retry_count 全リセット
+// ===========================================================================
+describe("clearAutoReplySchedule (Fix E': reset gave_up + last_error + retry_count)", () => {
+  beforeEach(() => {
+    mockCollection.updateOne.mockReset();
+  });
+
+  it("updateOne の $set に 5 フィールド全て含まれる", async () => {
+    const { clearAutoReplySchedule } = await import("@/lib/auto-reply");
+    await clearAutoReplySchedule("conv_x", SHOP_ID);
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    const setArg = update.$set as Record<string, unknown>;
+    expect(setArg.auto_reply_pending).toBe(false);
+    expect(setArg.auto_reply_due_at).toBe(null);
+    expect(setArg.auto_reply_retry_count).toBe(0);
+    expect(setArg.auto_reply_gave_up_at).toBe(null);
+    expect(setArg.auto_reply_last_error).toBe(null);
+    expect(setArg.updated_at).toBeInstanceOf(Date);
   });
 });

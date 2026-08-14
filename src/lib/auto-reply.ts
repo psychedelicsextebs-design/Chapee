@@ -413,7 +413,16 @@ export async function scheduleAutoReplyForUnread(
   }
 }
 
-/** スタッフ送信後・手動送信後に保留中の自動返信をキャンセル */
+/**
+ * スタッフ送信後・手動送信後 / staff replied 検知 / notification 判定等、
+ * 「auto-reply を進めない」判断で pending を解除する共通関数。
+ *
+ * Fix E' (2026-08-14): 「pending クリア = 対応が入った or 対応不要と判断された」
+ * = GIVE UP 警告 (auto_reply_gave_up_at) も表示不要 = リセットする。 これにより
+ * UI 上の「自動返信失敗」警告は staff 手動送信 / 完了マーク / staff replied 検知 /
+ * 自然回復のいずれかで自動的に消える。 retry_count も次回発生時のカウンタリセット
+ * のため 0 に戻す。
+ */
 export async function clearAutoReplySchedule(
   conversationId: string,
   shopId: number
@@ -425,6 +434,9 @@ export async function clearAutoReplySchedule(
       $set: {
         auto_reply_pending: false,
         auto_reply_due_at: null,
+        auto_reply_retry_count: 0,
+        auto_reply_gave_up_at: null,
+        auto_reply_last_error: null,
         updated_at: new Date(),
       },
     }
@@ -662,11 +674,26 @@ export type RescueAutoReplyResult = {
 const MAX_BATCH = 30;
 const RESCUE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const RESCUE_MAX_BATCH = 100;
+
 /**
- * Fix E (2026-08-14): sendMessage 失敗時の retry 上限。 到達で GIVE UP ログ + pending クリア。
- * 5 回 = 15分tick × 5 = 75分 window。 一時 API 障害の吸収と、 恒久エラーでの無限ループ防止のバランス。
+ * Fix E' (2026-08-14 root-cause redesign): 期限ベース retry。
+ *
+ * 【設計原則】
+ * 諦める条件は「ペナルティ期限切れ」のみ、 回数では諦めない。
+ * 期限内は cron が呼ばれる限り何度でも再試行する。 期限直前は緊急 cron
+ * (/api/cron/auto-reply-urgent, 1分間隔) で更に高頻度化する。
+ *
+ * PENALTY_WINDOW_MS = 12h: Shopee 応答率ペナルティは
+ *   「最初の未返信 buyer msg (first_unreplied_buyer_message_time) + 12h」
+ * を超えて未返信のまま = ペナルティカウント確定。 これが唯一の締切。
+ *
+ * URGENT_HORIZON_MS = 2h: この期限まで N h 以内 = 緊急枠として扱い、
+ * 1 分 cron の対象にする。 2h ならば 120 回試行可能。
+ *
+ * 旧 MAX_SEND_RETRY (=5 回で諦め) は削除。 12h 中 75 分しか使わない誤設計。
  */
-export const MAX_SEND_RETRY = 5;
+export const PENALTY_WINDOW_MS = 12 * 60 * 60 * 1000;
+export const URGENT_HORIZON_MS = 2 * 60 * 60 * 1000;
 
 /**
  * 一回限りの緊急テンプレID修正 (2026-05-19 / template content empty/missing 復旧)。
@@ -812,16 +839,24 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
     const nowMs = Date.now();
     const due = new Date(dueMs > nowMs ? dueMs : nowMs);
 
+    // Fix E' (2026-08-14): first_unreplied_buyer_message_time が未 populate なら
+    // baseMs (last_buyer or last_message の fallback) で埋める。 これは緊急 cron
+    // (`/api/cron/auto-reply-urgent`) の filter が populate 前提のため。
+    // 既に review が正しい値を書いていれば上書きしない (承認方針: field 空なら書く、
+    // 既存なら上書きしない)。
+    const setDoc: Record<string, unknown> = {
+      auto_reply_pending: true,
+      auto_reply_due_at: due,
+      rescue_at: new Date(),
+      updated_at: new Date(),
+    };
+    if (!(doc.first_unreplied_buyer_message_time instanceof Date)) {
+      setDoc.first_unreplied_buyer_message_time = new Date(baseMs);
+    }
+
     await col.updateOne(
       { conversation_id: doc.conversation_id, shop_id: doc.shop_id },
-      {
-        $set: {
-          auto_reply_pending: true,
-          auto_reply_due_at: due,
-          rescue_at: new Date(),
-          updated_at: new Date(),
-        },
-      }
+      { $set: setDoc }
     );
 
     result.rescued++;
@@ -837,7 +872,14 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
 /**
  * 期限到来の会話にテンプレートを送信（cron 用）
  */
-export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
+export async function processDueAutoReplies(opts?: {
+  /**
+   * true にすると「ペナルティ期限まで URGENT_HORIZON_MS 以内」の pending 会話
+   * だけを対象にする。 緊急 cron (/api/cron/auto-reply-urgent、 1 分間隔) 専用の
+   * 絞込。 通常 cron (15 分) は全 due 会話を対象 (undefined/false)。
+   */
+  urgentOnly?: boolean;
+}): Promise<ProcessAutoReplyResult> {
   // one-shot 緊急テンプレID修正 (2026-05-19)。 idempotent; 適用済みなら即 return。
   await applyOneShotTemplateFix();
 
@@ -882,6 +924,7 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
     auto_reply_pending?: boolean;
     auto_reply_due_at?: Date | null;
     auto_reply_retry_count?: number;
+    first_unreplied_buyer_message_time?: Date | null;
     last_auto_reply_at?: Date | null;
     chat_type?: string;
     last_message_time?: Date | null;
@@ -892,13 +935,21 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
   const now = new Date();
   const countries = await getSingletonAutoReplyCountries();
 
-  const due = await col
-    .find({
-      auto_reply_pending: true,
-      auto_reply_due_at: { $lte: now },
-    })
-    .limit(MAX_BATCH)
-    .toArray();
+  // urgentOnly=true: first_unreplied <= now - (PENALTY_WINDOW_MS - URGENT_HORIZON_MS)
+  //   = first_unreplied <= now - 10h  (= ペナルティ期限まで 2h 以内)
+  // first_unreplied_buyer_message_time が populate されていない legacy doc は
+  // urgent 対象外 (通常 cron が拾う)。
+  const findFilter: Record<string, unknown> = {
+    auto_reply_pending: true,
+    auto_reply_due_at: { $lte: now },
+  };
+  if (opts?.urgentOnly) {
+    findFilter.first_unreplied_buyer_message_time = {
+      $lte: new Date(now.getTime() - (PENALTY_WINDOW_MS - URGENT_HORIZON_MS)),
+    };
+  }
+
+  const due = await col.find(findFilter).limit(MAX_BATCH).toArray();
 
   for (const doc of due) {
     result.processed++;
@@ -1174,6 +1225,8 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
             last_auto_reply_at: new Date(),
             handling_status: "auto_replied_pending",
             auto_reply_retry_count: 0,
+            auto_reply_gave_up_at: null,
+            auto_reply_last_error: null,
             updated_at: new Date(),
           },
         }
@@ -1187,24 +1240,33 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
       console.error(`[auto-reply] Failed ${convId}:`, e);
 
       /**
-       * Fix E (2026-08-14): 旧実装は catch で無条件に pending=false にしていたため、
-       * ネットワーク瞬断など 1 回の失敗で永久停止していた (「取りこぼしゼロ」原則違反)。
-       * 新実装は auto_reply_retry_count で MAX_SEND_RETRY まで pending を保持し、
-       * 次tick 以降 rescue+process の自然サイクルで再送。 上限到達で明示 GIVE UP。
+       * Fix E' (2026-08-14 期限ベース redesign): 諦める条件は「Shopee ペナルティ
+       * 期限 (first_unreplied + 12h) 切れ」のみ。 回数では諦めない。
        *
-       * MAX_SEND_RETRY=5 (75分 window)。 恒久エラー (customer_id 不整合 / Shopee 側
-       * permanent reject 等) は他ガードで捕捉されるので、 send catch 到達は
-       * 主に一時的失敗 (5xx / タイムアウト / rate limit) と想定。
+       * 旧 Fix E (MAX_SEND_RETRY=5、 75分で諦め) は 12h 中 75 分しか使わない
+       * 誤設計だった。 12h あるうち全部使うのが正解。 期限直前は緊急 cron
+       * (/api/cron/auto-reply-urgent, 1分間隔) が最大 120 回試行を保証。
        *
-       * GIVE UP ログは Chatwork 通知等の外部監視対象にできるよう明確な形式で出力。
+       * fallback: first_unreplied 未populate の場合は now を基準に 12h 猶予
+       * (次tick で review が正しい値に置換される想定の一時救済)。
+       *
+       * MISSED DEADLINE ログ形式は外部監視/UI 警告の識別子。 変更しない。
        */
       try {
-        const currentRetry = Number(
-          (doc as { auto_reply_retry_count?: number }).auto_reply_retry_count ?? 0
-        );
-        const newRetry = currentRetry + 1;
-        if (newRetry >= MAX_SEND_RETRY) {
-          // 上限到達 → 諦めて明示的にログ
+        const firstUnrepliedTs =
+          doc.first_unreplied_buyer_message_time?.getTime?.();
+        const nowMs = Date.now();
+        const deadlineMs = firstUnrepliedTs
+          ? firstUnrepliedTs + PENALTY_WINDOW_MS
+          : nowMs + PENALTY_WINDOW_MS;
+
+        const retryCount =
+          Number(
+            (doc as { auto_reply_retry_count?: number }).auto_reply_retry_count ??
+              0
+          ) + 1;
+
+        if (nowMs >= deadlineMs) {
           await col.updateOne(
             { conversation_id: convId, shop_id: shopId },
             {
@@ -1218,23 +1280,27 @@ export async function processDueAutoReplies(): Promise<ProcessAutoReplyResult> {
               },
             }
           );
+          const overdueMinutes = Math.floor((nowMs - deadlineMs) / 60_000);
           console.error(
-            `[auto-reply] GIVE UP conv=${convId} shop=${shopId} retry=${newRetry} reason=${msg}`
+            `[auto-reply] MISSED DEADLINE conv=${convId} shop=${shopId} ` +
+              `retry=${retryCount} deadline=${new Date(deadlineMs).toISOString()} ` +
+              `overdue_min=${overdueMinutes} reason=${msg}`
           );
         } else {
-          // pending 温存 + retry_count インクリメント。 rescue+process が次tick 再試行。
           await col.updateOne(
             { conversation_id: convId, shop_id: shopId },
             {
               $set: {
-                auto_reply_retry_count: newRetry,
+                auto_reply_retry_count: retryCount,
                 auto_reply_last_error: msg,
                 updated_at: new Date(),
               },
             }
           );
+          const remainingHours = (deadlineMs - nowMs) / 3_600_000;
           console.warn(
-            `[auto-reply] retry pending conv=${convId} shop=${shopId} retry=${newRetry}/${MAX_SEND_RETRY}`
+            `[auto-reply] retry pending conv=${convId} shop=${shopId} ` +
+              `retry=${retryCount} remaining_h=${remainingHours.toFixed(2)}`
           );
         }
       } catch {
