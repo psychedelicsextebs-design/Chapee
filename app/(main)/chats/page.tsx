@@ -57,6 +57,12 @@ type ChatRow = {
   handling_status: HandlingStatus;
   /** Chapee 経由で記録された直近の店舗送信 */
   last_staff_send_kind?: LastStaffSendKind | null;
+  /**
+   * Fix E' (2026-08-14): auto-reply が MISSED DEADLINE で諦めた会話。
+   * staff 送信 / 完了マーク / 自然回復で自動リセット。 UI では赤枠 + 「自動返信失敗」
+   * バッジで強調表示、 dashboard link `?filter=give_up` で絞り込み対象。
+   */
+  give_up?: boolean;
 };
 
 type ColdStartBuyer = {
@@ -99,6 +105,8 @@ export default function ChatsPage() {
   const [selectedHandling, setSelectedHandling] = useState<HandlingStatus | "all">("all");
   const [search, setSearch] = useState("");
   const [unreadOnly, setUnreadOnly] = useState(false);
+  /** Fix E' UI: dashboard バナーからの ?filter=give_up ディープリンクに対応 */
+  const [giveUpOnly, setGiveUpOnly] = useState(false);
   const [selectedChats, setSelectedChats] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -122,11 +130,14 @@ export default function ChatsPage() {
     else if (h && isHandlingStatus(h)) setSelectedHandling(h);
     const q = searchParams.get("q");
     if (q) setSearch(q);
+    // Fix E' UI: dashboard バナー link `?filter=give_up` からの遷移対応
+    const f = searchParams.get("filter");
+    if (f === "give_up") setGiveUpOnly(true);
   }, [searchParams]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedHandling, selectedCountry, unreadOnly, search]);
+  }, [selectedHandling, selectedCountry, unreadOnly, giveUpOnly, search]);
 
   // コールドスタート検索: 検索文字列が 2 文字以上の時、 500ms デバウンスで全 shop 並列検索
   useEffect(() => {
@@ -190,6 +201,7 @@ export default function ChatsPage() {
         product?: string;
         date?: string;
         last_staff_send_kind?: LastStaffSendKind | null;
+        give_up?: boolean;
       }) => ({
         id: String(c.id),
         country: c.country,
@@ -205,6 +217,7 @@ export default function ChatsPage() {
           ? c.handling_status
           : "completed",
         last_staff_send_kind: c.last_staff_send_kind ?? null,
+        give_up: Boolean(c.give_up),
       })
     );
     // 後発の loadChats が既に走っていたら、この（古い）結果は捨てる
@@ -298,8 +311,11 @@ export default function ChatsPage() {
       selectedHandling === "all" || c.handling_status === selectedHandling;
     const matchSearch = matchChatSearchQuery(search, c);
     const matchUnread = !unreadOnly || c.unread > 0;
-    return matchCountry && matchHandling && matchSearch && matchUnread;
+    const matchGiveUp = !giveUpOnly || c.give_up === true;
+    return matchCountry && matchHandling && matchSearch && matchUnread && matchGiveUp;
   });
+
+  const giveUpCount = chats.filter((c) => c.give_up).length;
 
   const totalUnreadMessages = chats.reduce((s, c) => s + (c.unread > 0 ? c.unread : 0), 0);
   const unreadConversationCount = chats.filter((c) => c.unread > 0).length;
@@ -524,6 +540,42 @@ export default function ChatsPage() {
           </div>
         </div>
 
+        {/* Fix E' UI: 自動返信失敗フィルタ (dashboard バナー link 対応) */}
+        {(giveUpCount > 0 || giveUpOnly) && (
+          <div>
+            <label className="text-gray-700 text-sm font-semibold mb-2 block">
+              自動返信
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setGiveUpOnly(false)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
+                  !giveUpOnly
+                    ? "bg-primary text-white border-primary"
+                    : "bg-white text-gray-700 border-gray-200 hover:border-primary/50"
+                )}
+              >
+                すべて
+              </button>
+              <button
+                type="button"
+                onClick={() => setGiveUpOnly(true)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border flex items-center gap-1.5",
+                  giveUpOnly
+                    ? "bg-red-700 text-white border-red-700"
+                    : "bg-white text-red-700 border-red-300 hover:border-red-500"
+                )}
+              >
+                <AlertCircle size={14} />
+                自動返信失敗のみ ({giveUpCount})
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* 対応ステータス（未返信 / 自動返信のみ・要対応 / 対応中 / 完了） */}
         <div>
           <label className="text-gray-700 text-sm font-semibold mb-2 block">
@@ -614,8 +666,9 @@ export default function ChatsPage() {
                   hs === "unreplied" &&
                   chat.unread > 0 &&
                   chat.elapsed >= 8;
+                const isGiveUp = Boolean(chat.give_up);
                 return (
-                  <tr 
+                  <tr
                     key={chat.id}
                     className={cn(
                       "hover:bg-gray-50 cursor-pointer transition-colors",
@@ -624,7 +677,9 @@ export default function ChatsPage() {
                       urgentUnread &&
                         chat.elapsed < 11 &&
                         chat.elapsed >= 8 &&
-                        "bg-orange-50/50"
+                        "bg-orange-50/50",
+                      // Fix E' UI: GIVE UP は最強優先度 (auto-reply 諦め = 手動対応必須)
+                      isGiveUp && "!bg-red-200/60 !border-l-8 !border-l-red-700"
                     )}
                     onClick={() => router.push(`/chats/${chat.id}`)}
                   >
@@ -656,6 +711,14 @@ export default function ChatsPage() {
                         {chat.unread > 0 && (
                           <span className="text-[10px] font-bold uppercase tracking-wide text-red-600 bg-red-100 px-1.5 py-0.5 rounded">
                             要対応
+                          </span>
+                        )}
+                        {isGiveUp && (
+                          <span
+                            className="text-[10px] font-bold tracking-wide text-white bg-red-700 px-1.5 py-0.5 rounded animate-pulse"
+                            title="自動返信がペナルティ期限内に送信できませんでした。 手動での対応が必要です。"
+                          >
+                            自動返信失敗
                           </span>
                         )}
                       </div>

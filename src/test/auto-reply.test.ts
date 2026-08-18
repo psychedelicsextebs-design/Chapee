@@ -1740,7 +1740,7 @@ describe("clearAutoReplySchedule (Fix E': reset gave_up + last_error + retry_cou
     mockCollection.updateOne.mockReset();
   });
 
-  it("updateOne の $set に 5 フィールド全て含まれる", async () => {
+  it("updateOne の $set に 5 フィールド全て含まれる (default: preserveGiveUp なし)", async () => {
     const { clearAutoReplySchedule } = await import("@/lib/auto-reply");
     await clearAutoReplySchedule("conv_x", SHOP_ID);
     expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
@@ -1752,5 +1752,20 @@ describe("clearAutoReplySchedule (Fix E': reset gave_up + last_error + retry_cou
     expect(setArg.auto_reply_gave_up_at).toBe(null);
     expect(setArg.auto_reply_last_error).toBe(null);
     expect(setArg.updated_at).toBeInstanceOf(Date);
+  });
+
+  it("preserveGiveUp=true: gave_up_at / last_error は $set に含まれない", async () => {
+    const { clearAutoReplySchedule } = await import("@/lib/auto-reply");
+    await clearAutoReplySchedule("conv_x", SHOP_ID, { preserveGiveUp: true });
+    expect(mockCollection.updateOne).toHaveBeenCalledTimes(1);
+    const [, update] = mockCollection.updateOne.mock.calls[0];
+    const setArg = update.$set as Record<string, unknown>;
+    // pending/due/retry_count はリセット
+    expect(setArg.auto_reply_pending).toBe(false);
+    expect(setArg.auto_reply_due_at).toBe(null);
+    expect(setArg.auto_reply_retry_count).toBe(0);
+    // gave_up_at / last_error は残す
+    expect(setArg).not.toHaveProperty("auto_reply_gave_up_at");
+    expect(setArg).not.toHaveProperty("auto_reply_last_error");
   });
 });

@@ -422,24 +422,30 @@ export async function scheduleAutoReplyForUnread(
  * UI 上の「自動返信失敗」警告は staff 手動送信 / 完了マーク / staff replied 検知 /
  * 自然回復のいずれかで自動的に消える。 retry_count も次回発生時のカウンタリセット
  * のため 0 に戻す。
+ *
+ * opts.preserveGiveUp=true: gave_up_at / last_error は消さず、 pending / due /
+ * retry_count のみリセットする。 customer_id 未同期のような「対応してないが今tick
+ * では処理を止める」ケース用。 UI 警告 flicker (対応前に消える → 再表示) を防ぐ。
  */
 export async function clearAutoReplySchedule(
   conversationId: string,
-  shopId: number
+  shopId: number,
+  opts?: { preserveGiveUp?: boolean }
 ): Promise<void> {
   const col = await getCollection("shopee_conversations");
+  const setDoc: Record<string, unknown> = {
+    auto_reply_pending: false,
+    auto_reply_due_at: null,
+    auto_reply_retry_count: 0,
+    updated_at: new Date(),
+  };
+  if (!opts?.preserveGiveUp) {
+    setDoc.auto_reply_gave_up_at = null;
+    setDoc.auto_reply_last_error = null;
+  }
   await col.updateOne(
     { conversation_id: String(conversationId), shop_id: shopId },
-    {
-      $set: {
-        auto_reply_pending: false,
-        auto_reply_due_at: null,
-        auto_reply_retry_count: 0,
-        auto_reply_gave_up_at: null,
-        auto_reply_last_error: null,
-        updated_at: new Date(),
-      },
-    }
+    { $set: setDoc }
   );
 }
 
@@ -488,7 +494,9 @@ export async function reviewAutoReplySchedule(
     const customerId = Number(existing.customer_id ?? 0);
     if (!Number.isFinite(customerId) || customerId <= 0) {
       if (existing.auto_reply_pending) {
-        await clearAutoReplySchedule(convId, shopId);
+        // customer_id 未同期は「対応してない」ケース。 gave_up_at は保持して
+        // UI 警告の flicker (対応前に消える→再表示) を防ぐ。
+        await clearAutoReplySchedule(convId, shopId, { preserveGiveUp: true });
       }
       console.warn(
         `[auto-reply] review: skipped (customer_id 未同期) conv=${convId} shop=${shopId}`
@@ -965,7 +973,8 @@ export async function processDueAutoReplies(opts?: {
     // customer_id が未同期 → 判定不能なので送らない
     const customerIdNum = Number(doc.customer_id ?? 0);
     if (!Number.isFinite(customerIdNum) || customerIdNum <= 0) {
-      await clearAutoReplySchedule(convId, shopId);
+      // preserveGiveUp: review 側と同理由 (UI 警告の flicker 防止)
+      await clearAutoReplySchedule(convId, shopId, { preserveGiveUp: true });
       console.warn(
         `[auto-reply] pre-send: skipped (customer_id 未同期) conv=${convId} shop=${shopId}`
       );

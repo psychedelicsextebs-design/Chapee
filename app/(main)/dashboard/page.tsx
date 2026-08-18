@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
-  MessageSquare, Clock, AlertCircle,
+  MessageSquare, Clock, AlertCircle, AlertTriangle,
   ChevronRight, RefreshCw, Loader2, Settings,
   ShoppingCart, Bell, TrendingUp, CheckCircle2, XCircle,
   Search,
@@ -129,7 +129,10 @@ type Chat = {
   type?: ChatType;
   handling_status?: HandlingStatus;
   last_staff_send_kind?: LastStaffSendKind | null;
+  give_up?: boolean;
 };
+
+type TokenAlertShop = { shop_id: number; country: string; days: number };
 
 type SyncStatus = "idle" | "syncing" | "success" | "error";
 
@@ -153,6 +156,11 @@ export default function DashboardPage() {
   const [syncStartedAt, setSyncStartedAt] = useState<Date | null>(null);
   /** 本物の Shopee Seller Center 通知（🔔）の未読総数。ダッシュのカードに表示。 */
   const [shopNotifUnread, setShopNotifUnread] = useState(0);
+  /**
+   * Token 健全性警告: /api/shopee/status の updated_at が 40 日以上前の shop 一覧。
+   * refresh_token 60 日失効の危険域。
+   */
+  const [staleTokenShops, setStaleTokenShops] = useState<TokenAlertShop[]>([]);
 
   // ★ 絶対安全網: どんな経路で flag が立ったままになっても 75 秒で必ずクリア。
   //   safeJsonFetch のタイムアウトが効けばここまで来ないが、未来のコード変更で
@@ -193,6 +201,46 @@ export default function DashboardPage() {
     router.replace("/dashboard", { scroll: false });
   }, [router]);
 
+  /**
+   * Token 健全性チェック (Fix E' UI): dashboard mount 時と 15 分ごとに
+   * /api/shopee/status を叩き、 updated_at が 40 日以上前の shop を検出して
+   * 上部バナーに表示する。 /api/health/token-freshness は外部監視専用 (HTTP 500)
+   * なので、 UI 側は 200 で正常レスポンスを返す /api/shopee/status を使う。
+   */
+  useEffect(() => {
+    const STALE_THRESHOLD_DAYS = 40;
+    const checkTokens = async () => {
+      try {
+        const res = await fetch("/api/shopee/status");
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          connections?: Array<{
+            shop_id: number;
+            country: string;
+            updated_at?: string;
+          }>;
+        };
+        const conns = Array.isArray(data.connections) ? data.connections : [];
+        const now = Date.now();
+        const stale = conns
+          .map((c) => {
+            const ua = c.updated_at ? new Date(c.updated_at).getTime() : 0;
+            const days = ua
+              ? Math.floor((now - ua) / (24 * 3600 * 1000))
+              : Number.POSITIVE_INFINITY;
+            return { shop_id: c.shop_id, country: c.country, days };
+          })
+          .filter((s) => s.days >= STALE_THRESHOLD_DAYS);
+        setStaleTokenShops(stale);
+      } catch (e) {
+        console.error("[dashboard] token freshness check failed", e);
+      }
+    };
+    checkTokens();
+    const id = window.setInterval(checkTokens, 15 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
   const fetchChats = useCallback(async () => {
     // safeJsonFetch: タイムアウト + ok/content-type 検査を一括で適用。
     // 旧コードは res.json() の前に res.ok チェックがなく「Unexpected token 'A'」
@@ -206,6 +254,7 @@ export default function DashboardPage() {
       ...chat,
       type: chat.type || ("buyer" as ChatType),
       last_staff_send_kind: chat.last_staff_send_kind ?? null,
+      give_up: Boolean(chat.give_up),
     }));
   }, []);
 
@@ -442,6 +491,12 @@ export default function DashboardPage() {
     { label: "未読メッセージ", value: totalUnreadMessages, icon: AlertCircle, color: "text-red-600", bg: "bg-red-50 border-red-200" },
   ];
 
+  /** auto-reply が MISSED DEADLINE で諦めた会話数 (対応済で自動リセット)。 */
+  const giveUpCount = useMemo(
+    () => chats.filter((c) => c.give_up).length,
+    [chats]
+  );
+
   // 同期中の経過秒数を 1 秒間隔で再計算するためのティック (UI 表示用)。
   const [, forceTick] = useState(0);
   useEffect(() => {
@@ -455,6 +510,40 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-5 animate-fade-in">
+      {/* Fix E' UI: 最上位警告バナー (token stale + auto-reply MISSED DEADLINE) */}
+      {(staleTokenShops.length > 0 || giveUpCount > 0) && (
+        <div className="rounded-xl border-2 border-red-400 bg-red-50 p-4 space-y-2 shadow-sm">
+          <div className="flex items-center gap-2 font-bold text-red-800">
+            <AlertTriangle size={18} />
+            要対応の警告
+          </div>
+          <ul className="text-sm text-red-900 space-y-1 pl-6 list-disc">
+            {staleTokenShops.length > 0 && (
+              <li>
+                <strong>Shopee 接続</strong>: {staleTokenShops.length} shop の
+                token 更新が 40 日以上前です (60 日で refresh_token 失効 = 再認可
+                必要)。 対象: {" "}
+                {staleTokenShops
+                  .map((s) => `${s.country}(${s.days}日)`)
+                  .join(", ")}
+              </li>
+            )}
+            {giveUpCount > 0 && (
+              <li>
+                <strong>自動返信失敗</strong>: {giveUpCount} 件の会話で auto-reply
+                がペナルティ期限内に送信できませんでした。 {" "}
+                <Link
+                  href="/chats?filter=give_up"
+                  className="underline font-semibold hover:text-red-700"
+                >
+                  チャット管理で確認
+                </Link>
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+
       {/* ページタイトル */}
       <div className="flex items-center justify-between">
         <div>

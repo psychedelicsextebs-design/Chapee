@@ -49,6 +49,7 @@ export async function GET(request: NextRequest) {
       staff_message_kind_log?: { id: string; kind: string }[];
       handling_status?: HandlingStatus;
       last_auto_reply_at?: Date | null;
+      auto_reply_gave_up_at?: Date | null;
     }>("shopee_conversations");
 
     type ConvDoc = {
@@ -71,6 +72,7 @@ export async function GET(request: NextRequest) {
       staff_message_kind_log?: { id: string; kind: string }[];
       handling_status?: HandlingStatus;
       last_auto_reply_at?: Date | null;
+      auto_reply_gave_up_at?: Date | null;
     };
 
     const filterDoc: Filter<ConvDoc> = {};
@@ -156,6 +158,10 @@ export async function GET(request: NextRequest) {
         handling_status,
         type: conv.chat_type ?? "buyer",
         last_staff_send_kind: lastKind ?? null,
+        // Fix E' (2026-08-14): auto-reply が期限内に送信できず諦めた会話 (MISSED
+        // DEADLINE) を UI で識別可能にする。 staff 送信 / 完了マーク / 自然回復で
+        // clearAutoReplySchedule 経由でリセットされるため、 未対応の間だけ true。
+        give_up: conv.auto_reply_gave_up_at instanceof Date,
       };
     });
 

@@ -22,7 +22,7 @@
     },
     {
       "path": "/api/cron/auto-reply-urgent",
-      "schedule": "*/1 * * * *"
+      "schedule": "*/5 * * * *"
     }
   ]
 }
