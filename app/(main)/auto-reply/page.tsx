@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
+  AlertTriangle,
   Clock,
   Globe,
   ChevronRight,
@@ -74,6 +75,13 @@ export default function AutoReplyPage() {
   const [showSubAccounts, setShowSubAccounts] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  /**
+   * 層2 (SKILL.md「画面に出ない警告は無いのと同じ」):
+   * サーバー GET が返す template 不整合情報 — orphan (ID 実在しない) と
+   * empty_content (実在するが空)。 警告バナーで表示する。
+   */
+  const [templateOrphans, setTemplateOrphans] = useState<Record<string, string>>({});
+  const [emptyContent, setEmptyContent] = useState<Record<string, string>>({});
 
   const cfg = configs[selectedCountry];
 
@@ -101,14 +109,22 @@ export default function AutoReplyPage() {
       setTemplates(rows);
 
       let serverCountries: Record<string, CountryConfig> = {};
+      let serverOrphans: Record<string, string> = {};
+      let serverEmpty: Record<string, string> = {};
       if (arRes.ok) {
         const arData = (await arRes.json()) as {
           countries?: Record<string, CountryConfig>;
+          template_orphans?: Record<string, string>;
+          empty_content?: Record<string, string>;
         };
         serverCountries = arData.countries ?? {};
+        serverOrphans = arData.template_orphans ?? {};
+        serverEmpty = arData.empty_content ?? {};
       } else if (arRes.status === 401) {
         toast.error("ログインが必要です");
       }
+      setTemplateOrphans(serverOrphans);
+      setEmptyContent(serverEmpty);
 
       const merged: Record<string, CountryConfig> = {};
       for (const c of COUNTRIES) {
@@ -184,9 +200,29 @@ export default function AutoReplyPage() {
           toast.error("ログインが必要です");
           return;
         }
+        // 層1 validation エラー (400) のケース: server 側で orphan / 不正 ObjectId を弾いた
+        if (res.status === 400) {
+          try {
+            const err = (await res.json()) as {
+              error?: string;
+              details?: Array<{ country: string; template_id: string; reason: string }>;
+            };
+            const detailMsg = (err.details ?? [])
+              .map((d) => `${d.country}: ${d.reason}`)
+              .join(" / ");
+            toast.error(
+              detailMsg ? `${err.error ?? "validation 失敗"} (${detailMsg})` : (err.error ?? "validation 失敗")
+            );
+          } catch {
+            toast.error("保存に失敗しました (validation)");
+          }
+          return;
+        }
         throw new Error();
       }
       toast.success("保存しました");
+      // 保存成功時、 server 側の orphan/empty も更新される可能性 → 再取得して警告を最新化
+      await loadAll();
     } catch {
       toast.error("保存に失敗しました");
     } finally {
@@ -203,6 +239,10 @@ export default function AutoReplyPage() {
     );
   }
 
+  const orphanCountries = Object.keys(templateOrphans);
+  const emptyCountries = Object.keys(emptyContent);
+  const hasIssues = orphanCountries.length > 0 || emptyCountries.length > 0;
+
   return (
     <div className="space-y-5 animate-fade-in max-w-6xl w-full min-w-0">
       <div className="min-w-0">
@@ -211,6 +251,31 @@ export default function AutoReplyPage() {
           国別の条件と、テンプレート管理（reply_templates）に登録した本文を使用します
         </p>
       </div>
+
+      {/* 層2 (SKILL.md「画面に出ない警告は無いのと同じ」): template 不整合の全体サマリ */}
+      {hasIssues && (
+        <div className="rounded-xl border-2 border-amber-400 bg-amber-50 p-4 space-y-2">
+          <div className="flex items-center gap-2 font-bold text-amber-900">
+            <AlertTriangle size={18} />
+            テンプレート設定に不整合があります
+          </div>
+          <ul className="text-sm text-amber-900 space-y-1 pl-6 list-disc">
+            {orphanCountries.length > 0 && (
+              <li>
+                <strong>{orphanCountries.join(", ")}</strong>: 保存された template ID が reply_templates に存在しません (orphan)。
+                現在は fallback で最新の autoReply=true テンプレが送信されています。
+                各国のタブを開いて、 正しいテンプレートを選び直して <b>保存</b> してください。
+              </li>
+            )}
+            {emptyCountries.length > 0 && (
+              <li>
+                <strong>{emptyCountries.join(", ")}</strong>: 選択された template は実在しますが本文が空です。
+                テンプレート画面で本文を入力するか、 別のテンプレートに切り替えてください。
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
 
       <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-4">
         <div className="grid grid-cols-7 gap-3">
@@ -385,6 +450,20 @@ export default function AutoReplyPage() {
               テンプレート管理と同じ一覧です（この国向け・「全て」）。自動返信向けにチェックしたものは上に並びます。
             </p>
 
+            {/* 層2: 選択国のテンプレ不整合を個別表示 */}
+            {templateOrphans[selectedCountry] && (
+              <p className="text-sm text-red-900 bg-red-50 border border-red-300 rounded-xl px-3 py-2">
+                ⚠ 保存されている template ID <code className="text-xs bg-red-100 px-1 rounded">{templateOrphans[selectedCountry]}</code>{" "}
+                は reply_templates に存在しません (orphan)。
+                下から正しいテンプレートを選び直して <b>保存</b> してください。
+              </p>
+            )}
+            {emptyContent[selectedCountry] && (
+              <p className="text-sm text-amber-900 bg-amber-50 border border-amber-300 rounded-xl px-3 py-2">
+                ⚠ 選択された template <code className="text-xs bg-amber-100 px-1 rounded">{emptyContent[selectedCountry]}</code>{" "}
+                の本文が空です。 テンプレート画面で本文を入力するか、 別のテンプレートに切り替えてください。
+              </p>
+            )}
             {templatesForCountry.length === 0 ? (
               <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
                 {selectedCountry} 向けのテンプレートがありません。テンプレート画面で国を「全て」または

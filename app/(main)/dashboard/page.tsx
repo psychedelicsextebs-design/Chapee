@@ -161,6 +161,15 @@ export default function DashboardPage() {
    * refresh_token 60 日失効の危険域。
    */
   const [staleTokenShops, setStaleTokenShops] = useState<TokenAlertShop[]>([]);
+  /**
+   * 層4 (SKILL.md「画面に出ない警告は無いのと同じ」): auto-reply の
+   * template_id 不整合 (orphan / 実在するが本文空)。 /api/settings/auto-reply
+   * が返す template_orphans / empty_content から集計。
+   */
+  const [autoReplyTemplateIssues, setAutoReplyTemplateIssues] = useState<{
+    orphanCountries: string[];
+    emptyCountries: string[];
+  }>({ orphanCountries: [], emptyCountries: [] });
 
   // ★ 絶対安全網: どんな経路で flag が立ったままになっても 75 秒で必ずクリア。
   //   safeJsonFetch のタイムアウトが効けばここまで来ないが、未来のコード変更で
@@ -238,6 +247,36 @@ export default function DashboardPage() {
     };
     checkTokens();
     const id = window.setInterval(checkTokens, 15 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  /**
+   * 層4: auto-reply 設定の template 不整合チェック (dashboard mount 時 + 15分毎)。
+   * /api/settings/auto-reply は認証必須 (dashboard は既に auth 済の想定)。
+   * 401 の場合は表示せず (dashboard がそもそも見えていない状況)。
+   */
+  useEffect(() => {
+    const checkAutoReplyTemplates = async () => {
+      try {
+        const res = await fetch("/api/settings/auto-reply");
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          template_orphans?: Record<string, string>;
+          empty_content?: Record<string, string>;
+        };
+        setAutoReplyTemplateIssues({
+          orphanCountries: Object.keys(data.template_orphans ?? {}),
+          emptyCountries: Object.keys(data.empty_content ?? {}),
+        });
+      } catch (e) {
+        console.error("[dashboard] auto-reply template check failed", e);
+      }
+    };
+    checkAutoReplyTemplates();
+    const id = window.setInterval(
+      checkAutoReplyTemplates,
+      15 * 60 * 1000
+    );
     return () => window.clearInterval(id);
   }, []);
 
@@ -510,8 +549,11 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-5 animate-fade-in">
-      {/* Fix E' UI: 最上位警告バナー (token stale + auto-reply MISSED DEADLINE) */}
-      {(staleTokenShops.length > 0 || giveUpCount > 0) && (
+      {/* Fix E' UI: 最上位警告バナー (token stale + auto-reply MISSED DEADLINE + template 不整合) */}
+      {(staleTokenShops.length > 0 ||
+        giveUpCount > 0 ||
+        autoReplyTemplateIssues.orphanCountries.length > 0 ||
+        autoReplyTemplateIssues.emptyCountries.length > 0) && (
         <div className="rounded-xl border-2 border-red-400 bg-red-50 p-4 space-y-2 shadow-sm">
           <div className="flex items-center gap-2 font-bold text-red-800">
             <AlertTriangle size={18} />
@@ -537,6 +579,32 @@ export default function DashboardPage() {
                   className="underline font-semibold hover:text-red-700"
                 >
                   チャット管理で確認
+                </Link>
+              </li>
+            )}
+            {(autoReplyTemplateIssues.orphanCountries.length > 0 ||
+              autoReplyTemplateIssues.emptyCountries.length > 0) && (
+              <li>
+                <strong>Auto-reply テンプレート設定不整合</strong>:
+                {autoReplyTemplateIssues.orphanCountries.length > 0 && (
+                  <>
+                    {" "}orphan (ID 不在) {autoReplyTemplateIssues.orphanCountries.join(", ")}
+                  </>
+                )}
+                {autoReplyTemplateIssues.orphanCountries.length > 0 &&
+                  autoReplyTemplateIssues.emptyCountries.length > 0 &&
+                  " / "}
+                {autoReplyTemplateIssues.emptyCountries.length > 0 && (
+                  <>
+                    本文空 {autoReplyTemplateIssues.emptyCountries.join(", ")}
+                  </>
+                )}
+                {" "}—{" "}
+                <Link
+                  href="/auto-reply"
+                  className="underline font-semibold hover:text-red-700"
+                >
+                  自動返信設定で確認
                 </Link>
               </li>
             )}

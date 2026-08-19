@@ -703,57 +703,14 @@ const RESCUE_MAX_BATCH = 100;
 export const PENALTY_WINDOW_MS = 12 * 60 * 60 * 1000;
 export const URGENT_HORIZON_MS = 2 * 60 * 60 * 1000;
 
-/**
- * 一回限りの緊急テンプレID修正 (2026-05-19 / template content empty/missing 復旧)。
- *
- * 「テンプレ削除/編集のたびに auto_reply_settings の template_id が orphan に
- * なる」構造欠陥を、レイヤー 3 の resolveTemplateContent fallback で耐性付与
- * したのに加え、 既存の壊れた template_id 自体も復元するための one-shot 処理。
- *
- * 動作:
- *   - auto_reply_settings.template_fix_applied が true なら no-op (idempotent)
- *   - false / 未設定なら全カ国 template_id を営業時間外テンプレ
- *     (69fd937436d074c27df37548) に強制統一し、 template_fix_applied: true を立てる
- *
- * 次回 cron 以降は冒頭で早期 return するため、 本コードを残したまま放置しても
- * パフォーマンス影響はほぼゼロ (findOne 1 回)。 落ち着いたら別 commit で削除予定。
- */
-const TEMPLATE_FIX_TARGET_ID = "69fd937436d074c27df37548";
-
-async function applyOneShotTemplateFix(): Promise<void> {
-  try {
-    const col = await getCollection<{
-      _id: string;
-      countries?: Record<string, AutoReplyCountryCfg>;
-      template_fix_applied?: boolean;
-      updated_at?: Date;
-    }>("auto_reply_settings");
-
-    const doc = await col.findOne({ _id: "singleton" });
-    if (!doc) return;
-    if (doc.template_fix_applied === true) return;
-
-    const countries = doc.countries ?? {};
-    const countriesUpdated = Object.keys(countries);
-
-    const $set: Record<string, unknown> = {
-      template_fix_applied: true,
-      updated_at: new Date(),
-    };
-    for (const country of countriesUpdated) {
-      $set[`countries.${country}.template_id`] = TEMPLATE_FIX_TARGET_ID;
-    }
-
-    await col.updateOne({ _id: "singleton" }, { $set });
-
-    console.log(
-      `[auto-reply] template_fix: applied target=${TEMPLATE_FIX_TARGET_ID} ` +
-        `countries=${JSON.stringify(countriesUpdated)}`
-    );
-  } catch (e) {
-    console.error("[auto-reply] template_fix: failed (non-fatal)", e);
-  }
-}
+// 2026-08-19 撤去: applyOneShotTemplateFix + TEMPLATE_FIX_TARGET_ID
+//   - 2026-05-19 の one-shot fix。 適用済 (auto_reply_settings.template_fix_applied=true)
+//   - TARGET_ID (69fd937436d074c27df37548) が実在テンプレを指しておらず、 かつ
+//     現行 settings は既に別 ID (orphan) が入っている状態。 このコードは残しても
+//     no-op で害はないが、 将来「なぜこの ID が code に残っているのか」の混乱の元。
+//   代替検知: /api/settings/auto-reply GET が template_orphans / empty_content を
+//   返し、 auto-reply page + dashboard で画面警告する (SKILL.md「画面に出ない警告は
+//   無いのと同じ」原則遵守)。
 
 /**
  * フラグに依存しない救済スキャン (auto-reply 漏れ防止セーフティネット)。
@@ -888,35 +845,13 @@ export async function processDueAutoReplies(opts?: {
    */
   urgentOnly?: boolean;
 }): Promise<ProcessAutoReplyResult> {
-  // one-shot 緊急テンプレID修正 (2026-05-19)。 idempotent; 適用済みなら即 return。
-  await applyOneShotTemplateFix();
-
-  // [TEMP DIAG 2026-05-19] one-shot fix と template_id の現状確認。
-  // 真因確定後に削除する。
-  try {
-    const settingsCol = await getCollection<{
-      _id: string;
-      countries?: Record<string, AutoReplyCountryCfg>;
-      template_fix_applied?: boolean;
-      updated_at?: Date;
-    }>("auto_reply_settings");
-    const settingsDoc = await settingsCol.findOne({ _id: "singleton" });
-    console.log(
-      "[auto-reply] settings-dump",
-      JSON.stringify(
-        {
-          template_fix_applied: settingsDoc?.template_fix_applied ?? null,
-          countries: settingsDoc?.countries ?? null,
-          updated_at: settingsDoc?.updated_at ?? null,
-        },
-        null,
-        2
-      )
-    );
-  } catch (e) {
-    console.error("[auto-reply] settings-dump failed (non-fatal)", e);
-  }
-
+  // 2026-08-19 撤去:
+  //   - applyOneShotTemplateFix (2026-05-19 の TEMPLATE_FIX_TARGET_ID 適用)
+  //   - settings-dump TEMP DIAG (2026-05-19)
+  // 代替検知 (SKILL.md「検知手段を撤去するときは代替を用意する」):
+  //   /api/settings/auto-reply GET が template_orphans / empty_content を返し、
+  //   auto-reply page + dashboard の警告バナーで画面表示する。 同種問題
+  //   (template_id 不整合 / 本文空) は同等以上の検知性能を持つ。
   const result: ProcessAutoReplyResult = {
     processed: 0,
     sent: 0,
