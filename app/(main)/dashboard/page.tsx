@@ -130,6 +130,8 @@ type Chat = {
   handling_status?: HandlingStatus;
   last_staff_send_kind?: LastStaffSendKind | null;
   give_up?: boolean;
+  /** 結果ベース検知 (2026-09-21): 買い手未返信 10h 超 & 返信ゼロ */
+  stall?: boolean;
 };
 
 type TokenAlertShop = { shop_id: number; country: string; days: number };
@@ -294,6 +296,7 @@ export default function DashboardPage() {
       type: chat.type || ("buyer" as ChatType),
       last_staff_send_kind: chat.last_staff_send_kind ?? null,
       give_up: Boolean(chat.give_up),
+      stall: Boolean(chat.stall),
     }));
   }, []);
 
@@ -536,6 +539,16 @@ export default function DashboardPage() {
     [chats]
   );
 
+  /**
+   * 結果ベース検知 (2026-09-21): 買い手未返信 10h 超 & 返信ゼロの会話数。
+   * auto-reply の分類/pending/gave_up には依存しない独立判定。
+   * バックエンド `/api/chats` 側で `stall` field として算出。
+   */
+  const stallCount = useMemo(
+    () => chats.filter((c) => c.stall).length,
+    [chats]
+  );
+
   // 同期中の経過秒数を 1 秒間隔で再計算するためのティック (UI 表示用)。
   const [, forceTick] = useState(0);
   useEffect(() => {
@@ -549,9 +562,10 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-5 animate-fade-in">
-      {/* Fix E' UI: 最上位警告バナー (token stale + auto-reply MISSED DEADLINE + template 不整合) */}
+      {/* Fix E' UI: 最上位警告バナー (token stale + auto-reply MISSED DEADLINE + template 不整合 + stall) */}
       {(staleTokenShops.length > 0 ||
         giveUpCount > 0 ||
+        stallCount > 0 ||
         autoReplyTemplateIssues.orphanCountries.length > 0 ||
         autoReplyTemplateIssues.emptyCountries.length > 0) && (
         <div className="rounded-xl border-2 border-red-400 bg-red-50 p-4 space-y-2 shadow-sm">
@@ -577,6 +591,19 @@ export default function DashboardPage() {
                 <Link
                   href="/chats?filter=give_up"
                   className="underline font-semibold hover:text-red-700"
+                >
+                  チャット管理で確認
+                </Link>
+              </li>
+            )}
+            {stallCount > 0 && (
+              <li>
+                <strong className="text-orange-800">未返信 10h 以上</strong>:
+                {" "}{stallCount} 件の会話で、 買い手発信から 10h を超えても自動
+                返信も人間の返信も届いていません (Shopee 12h ペナルティ手前)。 {" "}
+                <Link
+                  href="/chats?filter=stall"
+                  className="underline font-semibold text-orange-800 hover:text-orange-900"
                 >
                   チャット管理で確認
                 </Link>

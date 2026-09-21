@@ -84,40 +84,75 @@ export const HUMAN_REPLY_MIN_INTERVAL_MS = 30_000;
  *   from_id=0 かつ to_id でも向きが特定できない場合は引き続き "unknown" を返す。
  *   呼び出し側は "unknown" を buyer/staff いずれの最終時刻にも採用しないため、
  *   Patch C (pre-send cooldown) で「分類不能だが直近活動あり」として安全側に倒す。
+ *
+ * Fix A refactor (2026-09-21 sender-aware):
+ *   旧実装は message_type のみで「システムカード → unknown」を **送信者判定より前** に
+ *   適用していた。 このため、 買い手が Shopee UI 経由で送る `variation_card` /
+ *   `product_card` / 未知の `_card` サフィックス型メッセージ (from_id=0, to_id=shop_id
+ *   でも send 側は buyer) が unknown に潰れ、 lastBuyerMs=0 となって auto-reply が
+ *   予約されない事故があった (2026-09-21 salihashardin/baimjalil/jayeseewhyehage
+ *   応答率漏れ調査、 「システムカード判定は店舗側から届いたものに限定」原則)。
+ *
+ *   新実装: from_id/to_id で senderKind を先に確定し、
+ *     - senderKind === "buyer" → 種類 (message_type) を問わず "buyer"
+ *     - senderKind === "staff" AND system pattern 一致 → "unknown"
+ *     - それ以外 (staff で real reply / 判定不能) → senderKind のまま
+ *   これで店舗側で Shopee が自動生成する logistics_card / new_faq 等は従来通り
+ *   除外され、 買い手発信の card 系は買い手として拾える。
  */
 export function classifyShopeeMessageSender(
   msg: Record<string, unknown>,
   customerId: number,
   shopId?: number
 ): "buyer" | "staff" | "unknown" {
-  // Fix A: 既知/パターン一致のシステムカードは常に "unknown" (buyer/staff どちらにも
-  // カウントしない → 応答率の起算点を消さない)。 from_id/to_id 判定より優先する。
-  if (looksLikeSystemGeneratedMessage(msg)) return "unknown";
-
+  // 1. from_id/to_id で senderKind を先に確定する (Patch A/D 経由)。 message_type は
+  //    見ない。 これにより、 買い手が送った variation_card 等が誤って system 扱いに
+  //    なる事故を防ぐ。
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
   const buyer = Number(customerId);
   const shop = Number(shopId ?? 0);
 
+  let senderKind: "buyer" | "staff" | "unknown";
+
   if (Number.isFinite(fromId) && fromId > 0) {
-    if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) return "buyer";
-    return "staff";
+    if (Number.isFinite(buyer) && buyer > 0 && fromId === buyer) {
+      senderKind = "buyer";
+    } else {
+      senderKind = "staff";
+    }
+  } else {
+    // from_id=0: Patch A/D で to_id から向きを推定する。
+    const toId = Number(msg.to_id ?? msg.to_user_id ?? 0);
+    if (Number.isFinite(toId) && toId > 0) {
+      if (Number.isFinite(buyer) && buyer > 0 && toId === buyer) {
+        // Patch A: 「buyer 宛」 → 送信者は staff 側 (shop / sub-account)。
+        senderKind = "staff";
+      } else if (Number.isFinite(shop) && shop > 0 && toId === shop) {
+        // Patch D: 「shop 宛」 → 送信者は buyer 側 (商品カード問い合わせ等)。
+        senderKind = "buyer";
+      } else {
+        senderKind = "unknown";
+      }
+    } else {
+      // Patch B: from_id=0 かつ to_id 不明 → 判定不能。
+      senderKind = "unknown";
+    }
   }
 
-  // Patch A: from_id=0 — sticker / system card 等。to_id で向きを推定する。
-  const toId = Number(msg.to_id ?? msg.to_user_id ?? 0);
-  if (Number.isFinite(toId) && toId > 0) {
-    if (Number.isFinite(buyer) && buyer > 0 && toId === buyer) {
-      // 「buyer 宛」が確定した → 送信者は staff 側 (shop or sub-account)。
-      return "staff";
-    }
-    // Patch D: 「shop 宛」が確定した → 送信者は buyer 側 (商品カード問い合わせ等)。
-    if (Number.isFinite(shop) && shop > 0 && toId === shop) {
-      return "buyer";
-    }
+  // 2. 買い手発信は種類 (message_type) を問わず "buyer" を返す。 SKILL.md 原則
+  //    「システムカード判定は店舗側から届いたものに限定」。
+  if (senderKind === "buyer") return "buyer";
+
+  // 3. Fix A: 店舗側発信のみ、 システムカード pattern に一致すれば "unknown" に格上げ
+  //    (buyer/staff どちらにもカウントせず、 応答率起算点を消さない)。
+  //    yonghuing 案件 (logistics_card 1s 後着弾) / cheeriotan 案件
+  //    (track_rr_status_card) 等の既知パターン + 未知の _card / _notification /
+  //    _prompt / _reminder / ^system_ 型を捕捉する。
+  if (senderKind === "staff" && looksLikeSystemGeneratedMessage(msg)) {
+    return "unknown";
   }
 
-  // Patch B: それ以外 (to_id 不明 / 0 / customer_id 不明) は "unknown" のまま。
-  return "unknown";
+  return senderKind;
 }
 
 /**

@@ -63,6 +63,13 @@ type ChatRow = {
    * バッジで強調表示、 dashboard link `?filter=give_up` で絞り込み対象。
    */
   give_up?: boolean;
+  /**
+   * 結果ベース検知 (2026-09-21): 買い手未返信が 10h を超え、 自動返信も人間の
+   * 返信も入っていない会話。 auto-reply の分類/pending/gave_up には依存しない
+   * 独立判定 (バックエンド /api/chats 側で算出)。 give_up (赤) より弱いオレンジ
+   * で強調、 dashboard link `?filter=stall` で絞り込み対象。
+   */
+  stall?: boolean;
 };
 
 type ColdStartBuyer = {
@@ -107,6 +114,8 @@ export default function ChatsPage() {
   const [unreadOnly, setUnreadOnly] = useState(false);
   /** Fix E' UI: dashboard バナーからの ?filter=give_up ディープリンクに対応 */
   const [giveUpOnly, setGiveUpOnly] = useState(false);
+  /** 結果ベース検知 (2026-09-21): dashboard バナーからの ?filter=stall ディープリンク */
+  const [stallOnly, setStallOnly] = useState(false);
   const [selectedChats, setSelectedChats] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 10;
@@ -133,11 +142,12 @@ export default function ChatsPage() {
     // Fix E' UI: dashboard バナー link `?filter=give_up` からの遷移対応
     const f = searchParams.get("filter");
     if (f === "give_up") setGiveUpOnly(true);
+    else if (f === "stall") setStallOnly(true);
   }, [searchParams]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedHandling, selectedCountry, unreadOnly, giveUpOnly, search]);
+  }, [selectedHandling, selectedCountry, unreadOnly, giveUpOnly, stallOnly, search]);
 
   // コールドスタート検索: 検索文字列が 2 文字以上の時、 500ms デバウンスで全 shop 並列検索
   useEffect(() => {
@@ -202,6 +212,7 @@ export default function ChatsPage() {
         date?: string;
         last_staff_send_kind?: LastStaffSendKind | null;
         give_up?: boolean;
+        stall?: boolean;
       }) => ({
         id: String(c.id),
         country: c.country,
@@ -218,6 +229,7 @@ export default function ChatsPage() {
           : "completed",
         last_staff_send_kind: c.last_staff_send_kind ?? null,
         give_up: Boolean(c.give_up),
+        stall: Boolean(c.stall),
       })
     );
     // 後発の loadChats が既に走っていたら、この（古い）結果は捨てる
@@ -312,10 +324,19 @@ export default function ChatsPage() {
     const matchSearch = matchChatSearchQuery(search, c);
     const matchUnread = !unreadOnly || c.unread > 0;
     const matchGiveUp = !giveUpOnly || c.give_up === true;
-    return matchCountry && matchHandling && matchSearch && matchUnread && matchGiveUp;
+    const matchStall = !stallOnly || c.stall === true;
+    return (
+      matchCountry &&
+      matchHandling &&
+      matchSearch &&
+      matchUnread &&
+      matchGiveUp &&
+      matchStall
+    );
   });
 
   const giveUpCount = chats.filter((c) => c.give_up).length;
+  const stallCount = chats.filter((c) => c.stall).length;
 
   const totalUnreadMessages = chats.reduce((s, c) => s + (c.unread > 0 ? c.unread : 0), 0);
   const unreadConversationCount = chats.filter((c) => c.unread > 0).length;
@@ -576,6 +597,43 @@ export default function ChatsPage() {
           </div>
         )}
 
+        {/* 結果ベース検知 (2026-09-21): 未返信長時間フィルタ (dashboard バナー link 対応) */}
+        {(stallCount > 0 || stallOnly) && (
+          <div>
+            <label className="text-gray-700 text-sm font-semibold mb-2 block">
+              未返信長時間
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setStallOnly(false)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
+                  !stallOnly
+                    ? "bg-primary text-white border-primary"
+                    : "bg-white text-gray-700 border-gray-200 hover:border-primary/50"
+                )}
+              >
+                すべて
+              </button>
+              <button
+                type="button"
+                onClick={() => setStallOnly(true)}
+                className={cn(
+                  "px-3 py-1.5 rounded-lg text-sm font-medium transition-all border flex items-center gap-1.5",
+                  stallOnly
+                    ? "bg-orange-600 text-white border-orange-600"
+                    : "bg-white text-orange-700 border-orange-300 hover:border-orange-500"
+                )}
+                title="買い手未返信が 10h 以上経過し、 自動返信も人間の返信もない会話 (Shopee 12h ペナルティ手前)"
+              >
+                <AlertCircle size={14} />
+                未返信 10h 以上 ({stallCount})
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* 対応ステータス（未返信 / 自動返信のみ・要対応 / 対応中 / 完了） */}
         <div>
           <label className="text-gray-700 text-sm font-semibold mb-2 block">
@@ -667,6 +725,7 @@ export default function ChatsPage() {
                   chat.unread > 0 &&
                   chat.elapsed >= 8;
                 const isGiveUp = Boolean(chat.give_up);
+                const isStall = Boolean(chat.stall);
                 return (
                   <tr
                     key={chat.id}
@@ -678,7 +737,11 @@ export default function ChatsPage() {
                         chat.elapsed < 11 &&
                         chat.elapsed >= 8 &&
                         "bg-orange-50/50",
+                      // 結果ベース検知 (2026-09-21): stall はオレンジで強調
+                      // (give_up 赤より弱く、 unread orange よりは強い枠線を出す)
+                      isStall && "!bg-orange-100/70 !border-l-8 !border-l-orange-600",
                       // Fix E' UI: GIVE UP は最強優先度 (auto-reply 諦め = 手動対応必須)
+                      // stall と重なる場合は赤 (give_up) が上書き
                       isGiveUp && "!bg-red-200/60 !border-l-8 !border-l-red-700"
                     )}
                     onClick={() => router.push(`/chats/${chat.id}`)}
@@ -719,6 +782,14 @@ export default function ChatsPage() {
                             title="自動返信がペナルティ期限内に送信できませんでした。 手動での対応が必要です。"
                           >
                             自動返信失敗
+                          </span>
+                        )}
+                        {isStall && !isGiveUp && (
+                          <span
+                            className="text-[10px] font-bold tracking-wide text-white bg-orange-600 px-1.5 py-0.5 rounded"
+                            title="買い手未返信が 10h 以上経過。 自動返信も人間の返信もありません (Shopee 12h ペナルティ手前)。"
+                          >
+                            長時間未対応
                           </span>
                         )}
                       </div>

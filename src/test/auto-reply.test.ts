@@ -1231,6 +1231,114 @@ describe("classifyShopeeMessageSender (Fix A: system card → unknown)", () => {
       )
     ).toBe("staff");
   });
+
+  // ---------------------------------------------------------------------------
+  // Fix A sender-aware refactor (2026-09-21):
+  //   買い手発信のカード系は種類を問わず "buyer" になる。 これがないと
+  //   variation_card / bundle_card 等が unknown に潰れ lastBuyerMs=0 になり、
+  //   auto-reply が予約されない (salihashardin / baimjalil / jayeseewhyehage 案件)。
+  //   店舗側発信のシステムカードは従来通り "unknown" のまま維持されなければならない
+  //   (yonghuing logistics_card / cheeriotan track_rr_status_card 案件)。
+  // ---------------------------------------------------------------------------
+
+  it("buyer-sent variation_card via Patch D (from_id=0, to_id=shop_id) → 'buyer' (2026-09-21 refactor)", () => {
+    // 買い手が Shopee UI からバリエーション選択で送るカード。 旧実装は /_card/ で
+    // 常に unknown に落としていた。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "variation_card", from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  it("buyer-sent product_card via Patch D → 'buyer'", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "product_card", from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  it("buyer-sent bundle_message via Patch D → 'buyer'", () => {
+    // bundle_message は pattern に一致しないが、 明示的に検証しておく。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "bundle_message", from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  it("buyer-sent unknown _card suffix via Patch D → 'buyer' (aggressive pattern would misfire)", () => {
+    // 未知の buyer 発 card サフィックス (Shopee が将来増やす可能性) も安全側 (buyer)。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "some_new_inquiry_card", from_id: 0, to_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  it("buyer-sent card with from_id=customer_id (直接 fromId 一致) → 'buyer'", () => {
+    // to_id fallback を使わずに fromId で直接判定できるケースも同じ結果。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "variation_card", from_id: CUSTOMER_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("buyer");
+  });
+
+  it("staff-sent track_rr_status_card (cheeriotan regression) → 'unknown'", () => {
+    // track_rr_status_card は KNOWN_SYSTEM_CARD_TYPES にはないが _card サフィックス
+    // で捕捉される。 refactor 後も staff-side なので unknown 維持。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "track_rr_status_card", from_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("staff-sent track_rr_status_card via Patch A (from_id=0, to_id=customer) → 'unknown'", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "track_rr_status_card", from_id: 0, to_id: CUSTOMER_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("staff-sent shipping_notification (pattern-based) → 'unknown'", () => {
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "shipping_notification", from_id: SHOP_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("unknown");
+  });
+
+  it("staff-sent sub-account real text reply → 'staff' (unchanged, refactor safe)", () => {
+    // Sub-account の personal user_id からの text 返信。 pattern 一致しないので
+    // "staff" 維持 (最重要 regression 保護: toyota_seg 案件)。
+    expect(
+      classifyShopeeMessageSender(
+        { message_type: "text", from_id: SUBACCOUNT_USER_ID },
+        CUSTOMER_ID,
+        SHOP_ID
+      )
+    ).toBe("staff");
+  });
 });
 
 // ===========================================================================

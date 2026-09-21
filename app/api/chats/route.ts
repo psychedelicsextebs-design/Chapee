@@ -11,6 +11,30 @@ import {
 type ChatType = "buyer" | "notification" | "affiliate";
 
 /**
+ * 結果ベース検知 (stall detection, 2026-09-21):
+ *
+ * 「買い手の未返信メッセージが N 時間経過しており、 自動返信も人間の返信も
+ *  無い」会話を、 原因を問わず警告対象にする。 auto-reply の内部ロジック
+ *  (classifyShopeeMessageSender / pending / gave_up_at) には一切依存しない
+ *  独立判定 — 分類のバグで警告まで黙らないための最終防衛層。
+ *
+ * 閾値 10h の根拠:
+ *   - Shopee ペナルティ = 12h。 それより 2h 前に警告する。
+ *   - SG triggerHour (8h): 10h = 8h + 2h → 自動返信が発火するはずの時刻から
+ *     2h 経過しても届いていない状態を検知。
+ *   - MY triggerHour (11h/9h): 10h = triggerHour 直前〜1h 経過。 自動返信の
+ *     発火予定より前 (or 直後) に検知できる。
+ *   - 固定値でハードコード: auto-reply 設定 (auto_reply_settings) に依存しない
+ *     ことで、 設定破壊 / 無効化された場合も警告が消えない。
+ *
+ * 判定入力 (いずれも classifyShopeeMessageSender と独立):
+ *   - handling_status === "unreplied" (resolveHandlingStatus 経由、 unread_count
+ *     と last_buyer_message_time > last_message_time の照合のみ)
+ *   - elapsed = now - (last_buyer_message_time ?? last_message_time)
+ */
+export const STALL_WARNING_HOURS = 10;
+
+/**
  * GET /api/chats — conversations synced from Shopee (`shopee_conversations` in MongoDB)
  */
 export async function GET(request: NextRequest) {
@@ -131,6 +155,18 @@ export async function GET(request: NextRequest) {
         last_buyer_message_time: conv.last_buyer_message_time,
       });
 
+      /**
+       * stall (2026-09-21): 買い手未返信が STALL_WARNING_HOURS を超え、
+       * かつ handling_status === "unreplied" (未読 or 買い手が最終発言) の会話。
+       * auto-reply 側の分類/pending/gave_up 状態には一切依存しない独立判定。
+       * chat_type=buyer 系のみを対象 (notification / affiliate は除外)。
+       */
+      const chatType = conv.chat_type ?? "buyer";
+      const stall =
+        chatType !== "notification" &&
+        handling_status === "unreplied" &&
+        elapsed >= STALL_WARNING_HOURS;
+
       return {
         id: conv.conversation_id,
         shop_id: conv.shop_id,
@@ -156,12 +192,13 @@ export async function GET(request: NextRequest) {
         pinned: conv.pinned,
         status: conv.status,
         handling_status,
-        type: conv.chat_type ?? "buyer",
+        type: chatType,
         last_staff_send_kind: lastKind ?? null,
         // Fix E' (2026-08-14): auto-reply が期限内に送信できず諦めた会話 (MISSED
         // DEADLINE) を UI で識別可能にする。 staff 送信 / 完了マーク / 自然回復で
         // clearAutoReplySchedule 経由でリセットされるため、 未対応の間だけ true。
         give_up: conv.auto_reply_gave_up_at instanceof Date,
+        stall,
       };
     });
 
