@@ -1,3 +1,4 @@
+import { extractWebchatPushIds } from "@/lib/webhook-chat-payload";
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { getCollection } from "@/lib/mongodb";
@@ -311,7 +312,9 @@ async function handleNewMessage(
   opts?: { fallbackShopId?: number }
 ) {
   try {
-    const conversationId = strU(data.conversation_id).trim();
+    // data 直下 (旧形式) と data.content (2026-10 以降の新形式) の両方から取り出す
+    const extracted = extractWebchatPushIds(data);
+    const conversationId = extracted.conversationId;
 
     // shop_id 解決の優先順位 (多層フォールバック):
     //   1. data.shop_id / data.shopId  (Shopee 公式 docs の場所)
@@ -321,7 +324,7 @@ async function handleNewMessage(
     // 4/27 ログで「[Webhook] handleNewMessage: missing shop_id」が 1〜2 分間隔で頻発し
     // 新着メッセージが DB 同期されず、auto-reply の last_buyer_message_time が
     // 古いまま → 誤発火の真因になっていた可能性がある。
-    let shopId = numU(data.shop_id ?? data.shopId);
+    let shopId = extracted.shopId;
     let shopIdSource: "data" | "payload_top" | "db_lookup" | "none" =
       shopId > 0 ? "data" : "none";
 
