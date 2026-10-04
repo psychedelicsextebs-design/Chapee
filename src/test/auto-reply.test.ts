@@ -1512,7 +1512,7 @@ describe("processDueAutoReplies (Fix E': deadline-based retry + MISSED DEADLINE)
     const buyerMsgMs = hoursAgo(opts.firstUnrepliedHoursAgo);
 
     mockCollection.find.mockReturnValue({
-      limit: () => ({
+      sort() { return this; }, limit: () => ({
         toArray: async () => [
           {
             conversation_id: "conv_fail",
@@ -1685,7 +1685,7 @@ describe("processDueAutoReplies (Fix E': deadline-based retry + MISSED DEADLINE)
   it("first_unreplied 未populate の場合 → fallback (now+12h 猶予) で retry 継続", async () => {
     // firstUnrepliedHoursAgo=0 (直近) だが、 意図的に field 未設定にする
     mockCollection.find.mockReturnValue({
-      limit: () => ({
+      sort() { return this; }, limit: () => ({
         toArray: async () => [
           {
             conversation_id: "conv_legacy",
@@ -1784,7 +1784,7 @@ describe("processDueAutoReplies (Fix E': deadline-based retry + MISSED DEADLINE)
       (filter: Record<string, unknown>) => {
         capturedFilter = filter;
         return {
-          limit: () => ({
+          sort() { return this; }, limit: () => ({
             toArray: async () => [],
           }),
         } as unknown as ReturnType<typeof mockCollection.find>;
@@ -1820,7 +1820,7 @@ describe("processDueAutoReplies (Fix E': deadline-based retry + MISSED DEADLINE)
       (filter: Record<string, unknown>) => {
         capturedFilter = filter;
         return {
-          limit: () => ({ toArray: async () => [] }),
+          sort() { return this; }, limit: () => ({ toArray: async () => [] }),
         } as unknown as ReturnType<typeof mockCollection.find>;
       }
     );
@@ -1875,5 +1875,40 @@ describe("clearAutoReplySchedule (Fix E': reset gave_up + last_error + retry_cou
     // gave_up_at / last_error は残す
     expect(setArg).not.toHaveProperty("auto_reply_gave_up_at");
     expect(setArg).not.toHaveProperty("auto_reply_last_error");
+  });
+});
+
+describe("decideEmptyRawListAction (2026-10-04: 空取得の会話の期限ベース扱い)", () => {
+  const H = 60 * 60 * 1000;
+  it("期限内は retry・retry_count+1", async () => {
+    const { decideEmptyRawListAction } = await import("@/lib/auto-reply");
+    const now = Date.now();
+    const r = decideEmptyRawListAction({
+      nowMs: now,
+      firstUnrepliedMs: now - 10 * H,
+      lastMessageMs: now - 10 * H,
+      retryCount: 3,
+    });
+    expect(r.action).toBe("retry");
+    expect(r.retryCount).toBe(4);
+  });
+  it("ペナルティ期限（12h）を過ぎたら give_up", async () => {
+    const { decideEmptyRawListAction } = await import("@/lib/auto-reply");
+    const now = Date.now();
+    const r = decideEmptyRawListAction({
+      nowMs: now,
+      firstUnrepliedMs: now - 13 * H,
+      lastMessageMs: null,
+      retryCount: 0,
+    });
+    expect(r.action).toBe("give_up");
+  });
+  it("first_unreplied が無ければ last_message、 両方無ければ現在起算で retry", async () => {
+    const { decideEmptyRawListAction } = await import("@/lib/auto-reply");
+    const now = Date.now();
+    expect(
+      decideEmptyRawListAction({ nowMs: now, lastMessageMs: now - 13 * H, retryCount: 0 }).action
+    ).toBe("give_up");
+    expect(decideEmptyRawListAction({ nowMs: now, retryCount: NaN }).action).toBe("retry");
   });
 });

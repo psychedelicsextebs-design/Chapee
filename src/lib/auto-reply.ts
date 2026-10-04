@@ -738,6 +738,27 @@ const RESCUE_MAX_BATCH = 100;
 export const PENALTY_WINDOW_MS = 12 * 60 * 60 * 1000;
 export const URGENT_HORIZON_MS = 2 * 60 * 60 * 1000;
 
+/**
+ * 2026-10-04: メッセージ取得が空 (rawList=[]) の会話の扱い。
+ * 期限内は retry (pending 温存・retry_count+1)、 ペナルティ期限を過ぎたら give_up。
+ * 起算点は first_unreplied_buyer_message_time → last_message_time → now の順。
+ */
+export function decideEmptyRawListAction(args: {
+  nowMs: number;
+  firstUnrepliedMs?: number | null;
+  lastMessageMs?: number | null;
+  retryCount: number;
+}): { action: "retry" | "give_up"; deadlineMs: number; retryCount: number } {
+  const baseMs = args.firstUnrepliedMs ?? args.lastMessageMs ?? args.nowMs;
+  const deadlineMs = baseMs + PENALTY_WINDOW_MS;
+  const retryCount = (Number.isFinite(args.retryCount) ? args.retryCount : 0) + 1;
+  return {
+    action: args.nowMs >= deadlineMs ? "give_up" : "retry",
+    deadlineMs,
+    retryCount,
+  };
+}
+
 // 2026-08-19 撤去: applyOneShotTemplateFix + TEMPLATE_FIX_TARGET_ID
 //   - 2026-05-19 の one-shot fix。 適用済 (auto_reply_settings.template_fix_applied=true)
 //   - TARGET_ID (69fd937436d074c27df37548) が実在テンプレを指しておらず、 かつ
@@ -796,10 +817,23 @@ export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResul
       chat_type: { $ne: "notification" },
       customer_id: { $gt: 0 },
       last_message_time: { $gte: cutoff },
-      $or: [
-        { last_auto_reply_at: { $exists: false } },
-        { last_auto_reply_at: null },
-        { $expr: { $lt: ["$last_auto_reply_at", "$last_message_time"] } },
+      $and: [
+        {
+          $or: [
+            { last_auto_reply_at: { $exists: false } },
+            { last_auto_reply_at: null },
+            { $expr: { $lt: ["$last_auto_reply_at", "$last_message_time"] } },
+          ],
+        },
+        // 2026-10-04: 期限切れで give up 済みの会話（最後のメッセージ以降に give up）
+        // を再フラグしない。 新しい着信で last_message_time が進めば再び対象になる。
+        {
+          $or: [
+            { auto_reply_gave_up_at: { $exists: false } },
+            { auto_reply_gave_up_at: null },
+            { $expr: { $lt: ["$auto_reply_gave_up_at", "$last_message_time"] } },
+          ],
+        },
       ],
     })
     .limit(RESCUE_MAX_BATCH)
@@ -927,7 +961,13 @@ export async function processDueAutoReplies(opts?: {
     };
   }
 
-  const due = await col.find(findFilter).limit(MAX_BATCH).toArray();
+  // 2026-10-04: 取得が空などで retry を重ねた会話を列の後ろへ回し、 新しい会話を
+  // 押し出さない (retry_count 未設定 = 0 扱いで先頭)。 同順位は期限の古い順。
+  const due = await col
+    .find(findFilter)
+    .sort({ auto_reply_retry_count: 1, auto_reply_due_at: 1 })
+    .limit(MAX_BATCH)
+    .toArray();
 
   for (const doc of due) {
     result.processed++;
@@ -1033,9 +1073,60 @@ export async function processDueAutoReplies(opts?: {
      * 誤発火 (送ってはいけないものを送る) はゼロのまま、 漏れだけ減らす。
      */
     if (rawList.length === 0) {
+      // 2026-10-04: 空取得が続く会話が列を占有し続ける不具合の対策。 期限ベースの
+      // retry 原則（設計原則コメント参照）をこの経路にも適用する:
+      // retry_count を増やして列の後ろへ回し (find の sort)、 ペナルティ期限を
+      // 過ぎたら give up (UI 警告 + MISSED DEADLINE ログ) して pending を外す。
+      const emptyDecision = decideEmptyRawListAction({
+        nowMs: Date.now(),
+        firstUnrepliedMs:
+          doc.first_unreplied_buyer_message_time?.getTime?.() ?? null,
+        lastMessageMs: doc.last_message_time?.getTime?.() ?? null,
+        retryCount: Number(doc.auto_reply_retry_count ?? 0),
+      });
+      try {
+        if (emptyDecision.action === "give_up") {
+          await col.updateOne(
+            { conversation_id: convId, shop_id: shopId },
+            {
+              $set: {
+                auto_reply_pending: false,
+                auto_reply_due_at: null,
+                auto_reply_retry_count: 0,
+                auto_reply_gave_up_at: new Date(),
+                auto_reply_last_error: "empty rawList until penalty deadline",
+                updated_at: new Date(),
+              },
+            }
+          );
+          console.error(
+            `[auto-reply] MISSED DEADLINE conv=${convId} shop=${shopId} ` +
+              `retry=${emptyDecision.retryCount} ` +
+              `deadline=${new Date(emptyDecision.deadlineMs).toISOString()} ` +
+              `reason=empty rawList until penalty deadline`
+          );
+        } else {
+          await col.updateOne(
+            { conversation_id: convId, shop_id: shopId },
+            {
+              $set: {
+                auto_reply_retry_count: emptyDecision.retryCount,
+                auto_reply_last_error: "empty rawList",
+                updated_at: new Date(),
+              },
+            }
+          );
+        }
+      } catch {
+        /* ignore: 次回 cron で再評価 */
+      }
       console.log(
         `[auto-reply] pre-send: empty rawList, preserving pending for retry ` +
-          `conv=${convId} shop=${shopId}`
+          `conv=${convId} shop=${shopId} country=${countryKey} ` +
+          `retry=${emptyDecision.retryCount} ` +
+          `lmt=${doc.last_message_time?.toISOString?.() ?? "none"} ` +
+          `deadline=${new Date(emptyDecision.deadlineMs).toISOString()} ` +
+          `action=${emptyDecision.action}`
       );
       result.skipped++;
       continue;

@@ -591,6 +591,19 @@ export async function fetchAllConversationMessages(
   const firstBatch = extractMessages(first);
   pushUnique(firstBatch);
 
+  // 2026-10-04 診断: 成功応答なのにメッセージが0件のとき、 応答の形（キー名のみ・
+  // 本文や個人情報は出さない）を残す。 空取得が続く会話の原因確定用。
+  if (firstBatch.length === 0) {
+    const resp = first.response as Record<string, unknown> | undefined;
+    console.warn(
+      `[shopee-api] get_message returned 0 messages shop=${shopId} ` +
+        `conv=${conversationId} country=${options?.country ?? "default"} ` +
+        `top_keys=${Object.keys(first).join(",")} ` +
+        `response_keys=${resp ? Object.keys(resp).join(",") : "none"} ` +
+        `request_id=${String(first.request_id ?? "")}`
+    );
+  }
+
   const pageResult = (first.response as Record<string, unknown> | undefined)
     ?.page_result as
     | { more?: boolean; next_cursor?: string | Record<string, unknown> }
