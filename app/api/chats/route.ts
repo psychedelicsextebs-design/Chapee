@@ -160,12 +160,25 @@ export async function GET(request: NextRequest) {
        * かつ handling_status === "unreplied" (未読 or 買い手が最終発言) の会話。
        * auto-reply 側の分類/pending/gave_up 状態には一切依存しない独立判定。
        * chat_type=buyer 系のみを対象 (notification / affiliate は除外)。
+       *
+       * 2026-10-24 修正: last_auto_reply_at が elapsedBase (buyer 最終発信時刻)
+       * より新しい場合は、 Shopee 応答率観点では既に自動返信が送信済み。
+       * handling_status が unreplied のまま滞留しているだけ (resolveHandlingStatus
+       * の transient race: sync 時に staff auto msg が rawList に無く
+       * buyerLast=true 判定され DB に unreplied が焼かれる現象) で、 ペナルティ
+       * には影響しない。 stall として警告すると「正常なのに警告が消えない」
+       * 疲労になるため除外する。 独立性は維持 (auto-reply の pending/gave_up は
+       * 見ず、 last_auto_reply_at という「確定事実」のみ参照)。
        */
       const chatType = conv.chat_type ?? "buyer";
+      const autoRepliedAfterBuyer =
+        conv.last_auto_reply_at instanceof Date &&
+        conv.last_auto_reply_at.getTime() >= elapsedBase.getTime();
       const stall =
         chatType !== "notification" &&
         handling_status === "unreplied" &&
-        elapsed >= STALL_WARNING_HOURS;
+        elapsed >= STALL_WARNING_HOURS &&
+        !autoRepliedAfterBuyer;
 
       return {
         id: conv.conversation_id,

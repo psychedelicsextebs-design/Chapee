@@ -21,16 +21,30 @@ import { shopeeMessageTimeToMs } from "@/lib/shopee-conversation-utils";
  *   2. パターン (_card / _notification / _prompt / _reminder / system_) にヒット
  *
  * 未知の新種カードにも一定の耐性を持たせるためパターンマッチも併用。
+ *
+ * Fix A 強化 (2026-10-24): give_up 46件調査で判明した追加 Shopee system card を
+ * KNOWN_SYSTEM_CARD_TYPES に追加:
+ *   - product_new / product : 新商品プロモ / 商品カード (shopee system 由来)
+ *   - extended_markdown     : rich content 配信
+ *   - faq_unsupported       : FAQ 自動応答 (未サポート質問)
+ *   - notification          : 汎用 shopee 通知 (plain)
+ * 根拠: /api/chats で give_up フラグが立った会話の lastMessage がこれらで、
+ * 本物の buyer 発信は無かった (/messages で msg 0件のケース含む)。
  */
 const KNOWN_SYSTEM_CARD_TYPES = new Set<string>([
   "logistics_card",
   "new_faq",
   "faq_liveagent_prompt",
   "faq_card",
+  "faq_unsupported",
   "return_refund_card",
   "out_of_stock_reminder_card",
   "auto_reply",
   "delivery_notification",
+  "product_new",
+  "product",
+  "extended_markdown",
+  "notification",
 ]);
 
 const SYSTEM_MESSAGE_PATTERN = /(_card|_notification|_prompt|_reminder|^system_)/;
@@ -42,6 +56,39 @@ export function looksLikeSystemGeneratedMessage(
   if (!mt) return false;
   if (KNOWN_SYSTEM_CARD_TYPES.has(mt)) return true;
   return SYSTEM_MESSAGE_PATTERN.test(mt);
+}
+
+/**
+ * 2026-10-24: 買い手が Shopee UI 経由で明示的に送信する「問い合わせカード」の
+ * 既知 message_type ホワイトリスト。 これらは `_card` suffix を持ち
+ * SYSTEM_MESSAGE_PATTERN に該当するが、 送信者は buyer なので system 扱いしない
+ * (salihashardin/baimjalil/jayeseewhyehage 案件、 2026-09-21 sender-aware refactor
+ * の意図を明示化)。
+ *
+ * 2026-10-24 の give_up 46件調査で判明: Shopee system は buyer-side pos
+ * (from_id=0, to_id=shop_id) で product_new / notification / extended_markdown を
+ * 配信する。 これらは **buyer 発信ではない** ため sender-aware refactor では
+ * buyer と誤分類していた。 対策: buyer-initiated whitelist に該当する msg のみ
+ * 「buyer-side pos = buyer 発信」とみなし、 それ以外の `_card` suffix 等は
+ * システム扱い (whitelist 外は常に system 判定優先)。
+ */
+const BUYER_INITIATED_INQUIRY_TYPES = new Set<string>([
+  "item",
+  "item_card",
+  "variation_card",
+  "bundle_card",
+  "bundle_message",
+  "product_card",
+  "product_link",
+  "deal_card",
+]);
+
+export function isBuyerInitiatedInquiry(
+  msg: Record<string, unknown>
+): boolean {
+  const mt = String(msg.message_type ?? msg.type ?? "").toLowerCase();
+  if (!mt) return false;
+  return BUYER_INITIATED_INQUIRY_TYPES.has(mt);
 }
 
 /**
@@ -93,12 +140,27 @@ export const HUMAN_REPLY_MIN_INTERVAL_MS = 30_000;
  *   予約されない事故があった (2026-09-21 salihashardin/baimjalil/jayeseewhyehage
  *   応答率漏れ調査、 「システムカード判定は店舗側から届いたものに限定」原則)。
  *
- *   新実装: from_id/to_id で senderKind を先に確定し、
- *     - senderKind === "buyer" → 種類 (message_type) を問わず "buyer"
- *     - senderKind === "staff" AND system pattern 一致 → "unknown"
- *     - それ以外 (staff で real reply / 判定不能) → senderKind のまま
- *   これで店舗側で Shopee が自動生成する logistics_card / new_faq 等は従来通り
- *   除外され、 買い手発信の card 系は買い手として拾える。
+ * Fix A 再修正 (2026-10-24 give_up 46件対応):
+ *   9/21 refactor は「buyer-side pos (to_id=shop_id) ならシステム判定を飛ばして
+ *   buyer を返す」挙動だった。 しかし本番で give_up 46件を観測し、 Shopee system
+ *   が buyer-side pos で product_new / notification / extended_markdown / product
+ *   等を配信することが判明。 これらは **本当は buyer 発信ではない** が
+ *   from_id=0, to_id=shop_id の形で届くため buyer と誤分類 → auto-reply 予約 →
+ *   send_message 失敗 → 12h リトライ → give_up。
+ *
+ *   新実装 (whitelist 方式):
+ *     1. from_id/to_id で senderKind を確定 (Patch A/D)
+ *     2. msg が BUYER_INITIATED_INQUIRY_TYPES (item/variation_card/bundle_message
+ *        等、 buyer が UI で明示的に送る既知 type) → senderKind を信用して返す
+ *     3. else looksLikeSystemGeneratedMessage → "unknown" (sender 問わず)
+ *     4. else → senderKind をそのまま返す
+ *
+ *   効果:
+ *     - buyer 発 variation_card → whitelist 命中 → "buyer" (9/21 の意図維持)
+ *     - Shopee system product_new (buyer-side pos) → whitelist 外 + system 命中 →
+ *       "unknown" (auto-reply 予約されず give_up 発生せず)
+ *     - staff 送信 logistics_card → whitelist 外 + system 命中 → "unknown" (従来通り)
+ *     - staff 送信 real text → whitelist 外 + system 不一致 → senderKind=staff
  */
 export function classifyShopeeMessageSender(
   msg: Record<string, unknown>,
@@ -106,8 +168,7 @@ export function classifyShopeeMessageSender(
   shopId?: number
 ): "buyer" | "staff" | "unknown" {
   // 1. from_id/to_id で senderKind を先に確定する (Patch A/D 経由)。 message_type は
-  //    見ない。 これにより、 買い手が送った variation_card 等が誤って system 扱いに
-  //    なる事故を防ぐ。
+  //    見ない。
   const fromId = Number(msg.from_id ?? msg.from_user_id ?? 0);
   const buyer = Number(customerId);
   const shop = Number(shopId ?? 0);
@@ -139,16 +200,17 @@ export function classifyShopeeMessageSender(
     }
   }
 
-  // 2. 買い手発信は種類 (message_type) を問わず "buyer" を返す。 SKILL.md 原則
-  //    「システムカード判定は店舗側から届いたものに限定」。
-  if (senderKind === "buyer") return "buyer";
+  // 2. 買い手が UI で明示的に送るカード (whitelist) → senderKind を信用。
+  //    sender-aware refactor の意図 (buyer 発 variation_card を buyer と拾う) を
+  //    明示的な type ホワイトリストで表現する。
+  if (isBuyerInitiatedInquiry(msg)) {
+    return senderKind;
+  }
 
-  // 3. Fix A: 店舗側発信のみ、 システムカード pattern に一致すれば "unknown" に格上げ
-  //    (buyer/staff どちらにもカウントせず、 応答率起算点を消さない)。
-  //    yonghuing 案件 (logistics_card 1s 後着弾) / cheeriotan 案件
-  //    (track_rr_status_card) 等の既知パターン + 未知の _card / _notification /
-  //    _prompt / _reminder / ^system_ 型を捕捉する。
-  if (senderKind === "staff" && looksLikeSystemGeneratedMessage(msg)) {
+  // 3. それ以外で system pattern に一致 → "unknown" (sender 問わず)。
+  //    Shopee system が buyer-side pos で配信する product_new / notification 等を
+  //    捕捉する (2026-10-24 give_up 46件対応)。
+  if (looksLikeSystemGeneratedMessage(msg)) {
     return "unknown";
   }
 
@@ -513,6 +575,7 @@ export async function reviewAutoReplySchedule(
       chat_type?: string;
       auto_reply_pending?: boolean;
       auto_reply_due_at?: Date | null;
+      auto_reply_gave_up_at?: Date | null;
       first_unreplied_buyer_message_time?: Date | null;
       last_auto_reply_at?: Date | null;
       last_message_time?: Date | null;
@@ -615,7 +678,13 @@ export async function reviewAutoReplySchedule(
 
     if (lastBuyerMs === 0) {
       // No buyer activity at all → nothing to auto-reply to.
-      if (existing.auto_reply_pending) {
+      // 2026-10-24: pending だけでなく stale gave_up_at も掃除する。 以前の
+      // sender-aware refactor (9/21) で Shopee system カード (product_new /
+      // notification 等) が buyer と誤分類され、 send 失敗で give_up が立った
+      // ケース 46件のクリーンアップ。 clearAutoReplySchedule は gave_up_at も
+      // null にする (preserveGiveUp 無指定時)。
+      const hasStaleGiveUp = existing.auto_reply_gave_up_at instanceof Date;
+      if (existing.auto_reply_pending || hasStaleGiveUp) {
         const staffLogLen = (existing.staff_message_kind_log ?? []).length;
         await clearAutoReplySchedule(convId, shopId);
         console.log(
@@ -626,7 +695,8 @@ export async function reviewAutoReplySchedule(
             `lmt=${existing.last_message_time?.toISOString?.() ?? "none"} ` +
             `lar=${existing.last_auto_reply_at?.toISOString?.() ?? "none"} ` +
             `staffLog=${staffLogLen} ` +
-            `rescue_at=${existing.rescue_at?.toISOString?.() ?? "none"}`
+            `rescue_at=${existing.rescue_at?.toISOString?.() ?? "none"} ` +
+            `cleared_gave_up=${hasStaleGiveUp}`
         );
       }
       return;

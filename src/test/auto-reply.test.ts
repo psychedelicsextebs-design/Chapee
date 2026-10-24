@@ -1274,15 +1274,76 @@ describe("classifyShopeeMessageSender (Fix A: system card → unknown)", () => {
     ).toBe("buyer");
   });
 
-  it("buyer-sent unknown _card suffix via Patch D → 'buyer' (aggressive pattern would misfire)", () => {
-    // 未知の buyer 発 card サフィックス (Shopee が将来増やす可能性) も安全側 (buyer)。
+  it("unknown _card suffix on buyer-side pos → 'unknown' (2026-10-24: whitelist 外)", () => {
+    // 2026-10-24 修正: 未知の _card suffix は buyer-side pos で届いても安全側で
+    // "unknown" に倒す (Shopee system が product_new 等を buyer-side pos で配信
+    // する実態への対応)。 BUYER_INITIATED_INQUIRY_TYPES whitelist 外の _card は
+    // system 判定が優先される。
     expect(
       classifyShopeeMessageSender(
         { message_type: "some_new_inquiry_card", from_id: 0, to_id: SHOP_ID },
         CUSTOMER_ID,
         SHOP_ID
       )
-    ).toBe("buyer");
+    ).toBe("unknown");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fix A 再修正 (2026-10-24 give_up 46件対応):
+  //   Shopee system が buyer-side pos (from_id=0, to_id=shop_id) で配信する
+  //   product_new / notification / extended_markdown / faq_unsupported / product
+  //   等が、 9/21 refactor では buyer と誤分類されていた → auto-reply 予約 →
+  //   send 失敗 → 12h リトライ → give_up。 whitelist 方式で安全側に倒す。
+  // ---------------------------------------------------------------------------
+
+  for (const mt of [
+    "product_new",
+    "product",
+    "extended_markdown",
+    "faq_unsupported",
+    "notification",
+  ]) {
+    it(`Shopee system "${mt}" on buyer-side pos → 'unknown' (give_up false-positive 対策)`, () => {
+      expect(
+        classifyShopeeMessageSender(
+          { message_type: mt, from_id: 0, to_id: SHOP_ID },
+          CUSTOMER_ID,
+          SHOP_ID
+        )
+      ).toBe("unknown");
+    });
+
+    it(`Shopee system "${mt}" on staff-side pos → 'unknown' (従来通り)`, () => {
+      expect(
+        classifyShopeeMessageSender(
+          { message_type: mt, from_id: 0, to_id: CUSTOMER_ID },
+          CUSTOMER_ID,
+          SHOP_ID
+        )
+      ).toBe("unknown");
+    });
+  }
+
+  it("BUYER_INITIATED whitelist: item/item_card/variation_card/bundle_card/bundle_message/product_card/product_link/deal_card は buyer-side pos で 'buyer' を維持", () => {
+    // whitelist を一括確認 (9/21 refactor の意図を 10/24 再修正でも保持)
+    for (const mt of [
+      "item",
+      "item_card",
+      "variation_card",
+      "bundle_card",
+      "bundle_message",
+      "product_card",
+      "product_link",
+      "deal_card",
+    ]) {
+      expect(
+        classifyShopeeMessageSender(
+          { message_type: mt, from_id: 0, to_id: SHOP_ID },
+          CUSTOMER_ID,
+          SHOP_ID
+        )
+      ).toBe("buyer");
+    }
   });
 
   it("buyer-sent card with from_id=customer_id (直接 fromId 一致) → 'buyer'", () => {

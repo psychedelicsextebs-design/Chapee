@@ -247,4 +247,62 @@ describe("GET /api/chats — stall detection (結果ベース検知 2026-09-21)"
     expect(json.chats[0].elapsed).toBeGreaterThanOrEqual(STALL_WARNING_HOURS);
     expect(json.chats[0].stall).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // 2026-10-24: last_auto_reply_at による stall false-positive 除外
+  // 現象: c.initial / suharimustaffa 等 29件が「auto-reply は送信済み」なのに
+  // handling_status=unreplied で stall フラグが立っていた (resolveHandlingStatus の
+  // transient race で DB に unreplied が焼かれる挙動)。
+  // 修正: last_auto_reply_at >= elapsedBase なら Shopee 応答率は満たされているので
+  // stall 対象外にする (handling_status の滞留と無関係に判定)。
+  // ---------------------------------------------------------------------------
+
+  it("auto-reply 済み (last_auto_reply_at > buyer msg) → stall=false (2026-10-24 false-positive 除外)", async () => {
+    const buyerT = new Date(Date.now() - 19 * HOUR_MS);
+    const autoAt = new Date(Date.now() - 11 * HOUR_MS); // 8h後に auto 送信
+    mockCol.find.mockReturnValue(
+      chain([
+        convDoc({
+          conversation_id: "auto-sent",
+          unread_count: 1, // handling=unreplied の transient 残骸
+          last_message_time: buyerT,
+          last_buyer_message_time: buyerT,
+          last_auto_reply_at: autoAt,
+        }),
+      ])
+    );
+    const res = await GET(req());
+    const json = (await res.json()) as {
+      chats: Array<{ stall: boolean; handling_status: string; elapsed: number }>;
+    };
+    expect(json.chats[0].handling_status).toBe("unreplied"); // 残骸は残る
+    expect(json.chats[0].elapsed).toBeGreaterThanOrEqual(STALL_WARNING_HOURS);
+    expect(json.chats[0].stall).toBe(false); // auto 送信済みなので warning 対象外
+  });
+
+  it("auto-reply 済みだが新規 buyer msg が後 → stall=true (真の未対応)", async () => {
+    // 境界: auto 送信した後に新しい buyer msg が来て 10h 経過 = 新規未対応
+    const oldBuyerT = new Date(Date.now() - 30 * HOUR_MS);
+    const oldAutoAt = new Date(Date.now() - 22 * HOUR_MS);
+    const newBuyerT = new Date(Date.now() - 11 * HOUR_MS); // auto 以降の新規 buyer
+    mockCol.find.mockReturnValue(
+      chain([
+        convDoc({
+          conversation_id: "new-buyer-after-auto",
+          unread_count: 1,
+          last_message_time: newBuyerT,
+          last_buyer_message_time: newBuyerT, // 最新 buyer は auto より新しい
+          last_auto_reply_at: oldAutoAt,       // auto は古い
+        }),
+      ])
+    );
+    const res = await GET(req());
+    const json = (await res.json()) as {
+      chats: Array<{ stall: boolean; elapsed: number }>;
+    };
+    expect(json.chats[0].elapsed).toBeGreaterThanOrEqual(STALL_WARNING_HOURS);
+    expect(json.chats[0].stall).toBe(true);
+    // 古い oldBuyerT (30h) は無関係 (test の意図は「新しい buyer が auto 以降に来ている」)
+    void oldBuyerT;
+  });
 });
