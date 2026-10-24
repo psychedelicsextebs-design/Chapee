@@ -859,6 +859,88 @@ export function decideEmptyRawListAction(args: {
  *   - last_message_time が staff 由来 (sticker 等で bump) でも一旦 pending →
  *     同じく pre-send guard で取消し。
  */
+/**
+ * 2026-10-25: stale な give_up 掃除 (cron 自動掃除)。
+ *
+ * rescueUnflaggedAutoReplies は last_message_time が 24h 以内の会話しか拾わない
+ * ため、 古い give_up (24h 超) は窓外で永遠に残骸として残る。 cron tick ごとに
+ * 一定数ずつ能動的に拾い、 reviewAutoReplySchedule を呼ぶことで新 classifier
+ * の判定で lastBuyerMs=0 なら自動 clear される (手動 admin 操作不要)。
+ *
+ * 処理コスト: Shopee API を会話数分呼ぶため MAX_BATCH で制限。 2026-10-24 の
+ * refactor 副作用で 45 件発生したが、 cron 15 分 × 5 件 = 15 件/時 で 3 時間で
+ * 自然掃除される。
+ *
+ * Caller (/api/cron/auto-reply) は process の前に実行して、 掃除された会話が
+ * 正常な pending 対象 (または単に無視) になった状態で process に流す。
+ */
+const STALE_GIVE_UP_SCAN_MAX = 10;
+
+export type CleanupStaleGiveUpsResult = {
+  scanned: number;
+  cleared: number;
+  preserved: number;
+  errors: number;
+};
+
+export async function cleanupStaleGiveUps(): Promise<CleanupStaleGiveUpsResult> {
+  const result: CleanupStaleGiveUpsResult = {
+    scanned: 0,
+    cleared: 0,
+    preserved: 0,
+    errors: 0,
+  };
+
+  const col = await getCollection<{
+    conversation_id: string;
+    shop_id: number;
+    country?: string;
+    auto_reply_gave_up_at?: Date | null;
+  }>("shopee_conversations");
+
+  const docs = await col
+    .find({ auto_reply_gave_up_at: { $exists: true, $ne: null } })
+    .sort({ auto_reply_gave_up_at: 1 }) // 古い give_up から順に掃除
+    .limit(STALE_GIVE_UP_SCAN_MAX)
+    .toArray();
+
+  for (const doc of docs) {
+    result.scanned++;
+    const convId = String(doc.conversation_id);
+    try {
+      const accessToken = await getValidToken(doc.shop_id);
+      const country = await resolveCountryForShop(doc.shop_id, doc.country);
+      const rawList = (await fetchAllConversationMessages(
+        accessToken,
+        doc.shop_id,
+        convId,
+        { country }
+      )) as Record<string, unknown>[];
+
+      await reviewAutoReplySchedule(rawList, doc.shop_id, convId);
+
+      // 掃除結果を検証 (gave_up が null になったか)
+      const after = await col.findOne({
+        conversation_id: convId,
+        shop_id: doc.shop_id,
+      });
+      if (after?.auto_reply_gave_up_at instanceof Date) {
+        result.preserved++;
+      } else {
+        result.cleared++;
+      }
+    } catch (e) {
+      result.errors++;
+      console.warn(
+        `[auto-reply] cleanup-give-up failed conv=${convId} shop=${doc.shop_id}:`,
+        e
+      );
+    }
+  }
+
+  return result;
+}
+
 export async function rescueUnflaggedAutoReplies(): Promise<RescueAutoReplyResult> {
   const result: RescueAutoReplyResult = { scanned: 0, rescued: 0, skipped: 0 };
 

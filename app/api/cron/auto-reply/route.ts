@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
+  cleanupStaleGiveUps,
   processDueAutoReplies,
   rescueUnflaggedAutoReplies,
 } from "@/lib/auto-reply";
@@ -32,6 +33,13 @@ export async function GET(request: NextRequest) {
     // 真因確定後に diag-auto-reply-pipeline 一式と共に削除する。
     await logAutoReplyPipelineDiag("cron");
 
+    // 2026-10-25: 24h 窓外に残った stale give_up を能動的に掃除する。
+    // rescue の 24h 窓では拾えないため、 毎 tick で最大 10 件ずつ Shopee API で
+    // 再評価 → review が「buyer msg 無し」判定なら gave_up を自動 clear。
+    // 2026-10-24 の Fix A refactor 副作用 (45件) を手動 admin 不要で復旧させる。
+    const cleanup = await cleanupStaleGiveUps();
+    console.log("[cron/auto-reply] cleanup-give-up", cleanup);
+
     // フラグ立ての 3 経路 (webhook / sync / chats-messages review) が空振りした
     // 場合の最後の砦。 直近 24h の buyer 着信を網羅的に拾って pending=true を
     // 立てるだけで、 staff 応答などの検証は processDueAutoReplies の pre-send
@@ -44,6 +52,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
+      cleanup,
       rescue,
       ...results,
     });
